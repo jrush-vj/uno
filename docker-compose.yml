@@ -1,0 +1,79 @@
+services:
+  uno:
+    build: .
+    image: uno-online:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "8899"
+      TURN_URL: ${TURN_URL:-}
+      TURN_USERNAME: ${TURN_USERNAME:-}
+      TURN_CREDENTIAL: ${TURN_CREDENTIAL:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      MAX_ROOMS: ${MAX_ROOMS:-200}
+    expose:
+      - "8899"
+    depends_on:
+      - coturn
+    networks:
+      - uno
+
+  coturn:
+    image: coturn/coturn:4.6
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    # `$$` escapes compose interpolation so the shell expands these at runtime.
+    # --external-ip is only added when TURN_EXTERNAL_IP is non-empty, so a host
+    # with a directly routable public IP can leave it blank.
+    command:
+      - >
+        exec turnserver
+        --log-file=stdout
+        --lt-cred-mech
+        --fingerprint
+        --no-cli
+        --no-tls
+        --no-dtls
+        --realm=$${TURN_REALM}
+        --user=$${TURN_USERNAME}:$${TURN_CREDENTIAL}
+        $${TURN_EXTERNAL_IP:+--external-ip=$${TURN_EXTERNAL_IP}}
+        --listening-port=3478
+        --min-port=49160
+        --max-port=49200
+    environment:
+      TURN_REALM: ${TURN_REALM:-uno.local}
+      TURN_USERNAME: ${TURN_USERNAME:-uno}
+      TURN_CREDENTIAL: ${TURN_CREDENTIAL:-change-me}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49160-49200:49160-49200/udp"
+    networks:
+      - uno
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file:
+      - .env
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - uno
+    networks:
+      - uno
+
+networks:
+  uno:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:

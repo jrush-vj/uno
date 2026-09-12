@@ -1,0 +1,18 @@
+# For hosts that ALREADY provide TLS (reverse proxy / Cloudflare Tunnel) and a
+# TURN server. Runs only the game app and publishes port 8899.
+services:
+  uno:
+    build: .
+    image: uno-online:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "8899"
+      TURN_URL: ${TURN_URL:-}
+      TURN_USERNAME: ${TURN_USERNAME:-}
+      TURN_CREDENTIAL: ${TURN_CREDENTIAL:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      MAX_ROOMS: ${MAX_ROOMS:-200}
+    ports:
+      - "8899:8899"

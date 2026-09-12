@@ -1,0 +1,26 @@
+# Public deployment: Caddy terminates TLS (automatic Let's Encrypt cert) and
+# proxies both HTTP and WebSocket traffic to the game server. `wss://` is
+# required for browser camera/mic access on anything other than localhost.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy uno:8899
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}
+
+# --- LAN-only fallback (no domain, no TLS) -----------------------------------
+# Uncomment the block below and comment out the {$DOMAIN} block above to serve
+# over plain HTTP on your LAN. NOTE: browsers only grant camera/mic access on
+# `localhost` or HTTPS, so players on other machines will not get video/audio
+# without TLS. Prefer a domain + the block above.
+#
+# :80 {
+# 	encode gzip
+# 	reverse_proxy uno:8899
+# }

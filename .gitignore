@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment / secrets
+.env
+
+# Tooling / editor
+.commandcode/
+.pytest_cache/
+.ruff_cache/
+.idea/
+.vscode/
+.DS_Store
