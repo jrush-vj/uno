@@ -1,5 +1,5 @@
 """
-UNO Online — self-hosted 7-player multiplayer server with persistent scoring,
+UNO Online — self-hosted 4-player multiplayer server with persistent scoring,
 live video/audio (WebRTC mesh), reconnect-safe sessions, and a manual
 "exit table" flow.
 
@@ -35,12 +35,7 @@ stay disconnected for AUTO_SKIP_DISCONNECTED_SECONDS, the server draws
 everyone else.
 
 Run:
-    # Docker (recommended for self-hosting)
-    cp .env.example .env        # then edit DOMAIN / TURN_* values
-    docker compose up -d --build
-
-    # Local development
-    pip install -r requirements.txt
+    pip install -r requirements.txt     # fastapi + uvicorn[standard]
     python server.py
 """
 
@@ -54,7 +49,6 @@ import random
 import re
 import time
 import uuid
-from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,7 +70,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_SEATS = 7
+MAX_SEATS = 4
 UNO_CATCH_PENALTY = 2
 DRAW2_PENALTY = 2
 DRAW4_PENALTY = 4
@@ -90,24 +84,10 @@ AUTO_SKIP_DISCONNECTED_SECONDS = 25  # how long the *active* player can be
 WATCHDOG_INTERVAL_SECONDS = 5
 
 ROOM_ID_RE = re.compile(r"[^a-zA-Z0-9_-]")
-CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 COLORS = ["red", "yellow", "green", "blue"]
 NUMBER_VALUES = [str(n) for n in range(10)]
 ACTION_VALUES = ["skip", "reverse", "draw2"]
-
-# Security / resource limits (all env-overridable for self-hosters)
-ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
-MAX_ROOMS = int(os.environ.get("MAX_ROOMS", "200"))
-MAX_MESSAGE_BYTES = int(os.environ.get("MAX_MESSAGE_BYTES", "65536"))
-RATE_LIMIT_PER_SEC = int(os.environ.get("RATE_LIMIT_PER_SEC", "100"))
-
-
-def clean_name(raw: Optional[str]) -> str:
-    """Normalize a player-supplied display name: drop control characters,
-    trim surrounding whitespace, and cap the length."""
-    name = CONTROL_CHARS_RE.sub("", raw or "").strip()[:24]
-    return name or "Player"
 
 
 # --------------------------------------------------------------------------
@@ -118,9 +98,8 @@ def _fisher_yates_shuffle(items: list) -> None:
     """In-place Fisher–Yates shuffle using a cryptographically stronger
     random source than the default Mersenne Twister, for a genuinely
     unpredictable deal every round."""
-    rng = random.SystemRandom()
     for i in range(len(items) - 1, 0, -1):
-        j = rng.randint(0, i)
+        j = random.SystemRandom().randint(0, i)
         items[i], items[j] = items[j], items[i]
 
 
@@ -207,13 +186,9 @@ rooms: dict[str, Room] = {}
 _rooms_guard = asyncio.Lock()
 
 
-async def get_or_create_room(room_id: str) -> Optional[Room]:
-    """Fetch a room, creating it on first join. Returns None when the server
-    is already at MAX_ROOMS and this room does not exist yet."""
+async def get_or_create_room(room_id: str) -> Room:
     async with _rooms_guard:
         if room_id not in rooms:
-            if len(rooms) >= MAX_ROOMS:
-                return None
             rooms[room_id] = Room(room_id=room_id)
         return rooms[room_id]
 
@@ -279,6 +254,13 @@ def card_playable(room: Room, card: dict) -> bool:
     return card["color"] == room.current_color or card["value"] == top_value
 
 
+def player_has_playable(room: Room, player: Player) -> bool:
+    """True if the player currently holds at least one card that can be
+    played on the discard pile. Used to decide whether a drawn turn can
+    end automatically (no playable card) or must wait for a play."""
+    return any(card_playable(room, c) for c in player.hand)
+
+
 # --------------------------------------------------------------------------
 # Scoring
 # --------------------------------------------------------------------------
@@ -323,6 +305,20 @@ def leaderboard(room: Room, winner: Optional[Player] = None, round_points: int =
 # --------------------------------------------------------------------------
 # Game actions
 # --------------------------------------------------------------------------
+
+def clear_all_hands(room: Room) -> None:
+    """Called whenever a round is NOT in progress.
+
+    Nobody holds cards outside a live round — if the round is over or was
+    abandoned (a seat emptied), every hand is emptied so no client can show
+    cards that were never dealt for the current match.
+    """
+    for p in room.players.values():
+        p.hand = []
+        p.called_uno = False
+        p.drew_this_turn = False
+        p.last_drawn_card_id = None
+
 
 def start_game(room: Room) -> None:
     room.deck = build_deck()
@@ -523,9 +519,12 @@ async def remove_player(room: Room, player: Player) -> Optional[Player]:
         if room.started and len(room.players) < 2:
             room.started = False
             next_turn_player = None
-        for p in room.players.values():
-            p.drew_this_turn = False
-            p.last_drawn_card_id = None
+        if not room.started:
+            clear_all_hands(room)
+        else:
+            for p in room.players.values():
+                p.drew_this_turn = False
+                p.last_drawn_card_id = None
     return next_turn_player
 
 
@@ -574,6 +573,7 @@ def public_state(room: Room) -> dict:
         "started": room.started,
         "host_seat": host_seat,
         "player_count": len(room.players),
+        "max_seats": MAX_SEATS,
     }
 
 
@@ -621,6 +621,21 @@ async def broadcast_notice(room: Room, message: str) -> None:
             await send_json(p.ws, payload)
 
 
+async def broadcast_chat(room: Room, player: Player, text: str) -> None:
+    """Table chat. Relayed verbatim to every connected seat, including the
+    sender, so all clients render the same ordered transcript."""
+    payload = {
+        "type": "chat",
+        "seat": player.seat,
+        "name": player.name,
+        "text": text,
+        "ts": time.time(),
+    }
+    for p in room.players.values():
+        if p.connected:
+            await send_json(p.ws, payload)
+
+
 # --------------------------------------------------------------------------
 # Background loops
 # --------------------------------------------------------------------------
@@ -650,10 +665,14 @@ async def _cleanup_loop() -> None:
                     room.host_token = next(iter(room.players))
                 if room.started and len(room.players) < 2:
                     room.started = False
+                if not room.started and room.players:
+                    clear_all_hands(room)
                 if not room.players:
                     empty_rooms.append(rid)
             if changed and room.players:
                 await broadcast_state(room)
+                for p in room.players.values():
+                    await send_hand(p)
                 await broadcast_peers(room)
                 for nm in removed_names:
                     await broadcast_notice(room, f"{nm}'s seat was released (disconnected too long)")
@@ -723,58 +742,24 @@ app.add_middleware(GZipMiddleware, minimum_size=512)
 async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
     room_id = ROOM_ID_RE.sub("", room_id)[:32] or "main"
     await websocket.accept()
-
-    # Origin allow-list. Empty ALLOWED_ORIGINS means "allow any" (fine for a
-    # private homelab; set it for anything publicly reachable).
-    if ALLOWED_ORIGINS and websocket.headers.get("origin") not in ALLOWED_ORIGINS:
-        await send_json(websocket, {"type": "error", "message": "Origin not allowed"})
-        await websocket.close(code=1008)
-        return
-
     room = await get_or_create_room(room_id)
-    if room is None:
-        await send_json(websocket, {"type": "error", "message": "Server at capacity, try again later"})
-        await websocket.close(code=1013)
-        return
-
     player: Optional[Player] = None
-    recent_msgs: deque[float] = deque()
 
     try:
         while True:
             raw = await websocket.receive_text()
-
-            # Reject oversized frames before parsing them.
-            if len(raw) > MAX_MESSAGE_BYTES:
-                await send_json(websocket, {"type": "error", "message": "Message too large"})
-                await websocket.close(code=1009)
-                return
-
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
             mtype = msg.get("type")
 
-            # Per-connection rate limit (sliding one-second window). WebRTC
-            # signaling is exempt: a 7-player mesh legitimately bursts dozens
-            # of offers/answers/ICE candidates while connections are set up.
-            if RATE_LIMIT_PER_SEC > 0 and mtype != "webrtc":
-                now = time.monotonic()
-                while recent_msgs and now - recent_msgs[0] > 1.0:
-                    recent_msgs.popleft()
-                recent_msgs.append(now)
-                if len(recent_msgs) > RATE_LIMIT_PER_SEC:
-                    await send_json(websocket, {"type": "error", "message": "Rate limit exceeded"})
-                    await websocket.close(code=1008)
-                    return
-
             # ---- join / reconnect -------------------------------------
             if mtype == "join":
                 is_new_player = False
                 async with room.lock:
                     token = msg.get("token")
-                    name = clean_name(msg.get("name"))
+                    name = (msg.get("name") or "Player").strip()[:24] or "Player"
                     existing = room.players.get(token) if token else None
                     if existing is not None:
                         player = existing
@@ -839,8 +824,9 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
             # ---- draw ------------------------------------------------
             elif mtype == "draw":
                 try:
+                    playable = False
                     async with room.lock:
-                        handle_draw(room, player)
+                        drawn, playable = handle_draw(room, player)
                     await broadcast_state(room)
                     await send_hand(player)
                 except ValueError as e:
@@ -854,10 +840,19 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                         round_points = 0
                         if winner:
                             round_points = settle_round(room, player)
+                            # settle first (it scores the losers' hands), then
+                            # the table is cleared — no cards outside a round
+                            clear_all_hands(room)
                     await broadcast_state(room)
-                    await send_hand(player)
-                    if victim:
-                        await send_hand(victim)
+                    if winner:
+                        # the round is over and every hand was just emptied,
+                        # so push the (now empty) hand to all clients
+                        for p in room.players.values():
+                            await send_hand(p)
+                    else:
+                        await send_hand(player)
+                        if victim:
+                            await send_hand(victim)
                     if winner:
                         board = leaderboard(room, winner=player, round_points=round_points)
                         for p in room.players.values():
@@ -898,6 +893,10 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                 await broadcast_notice(room, f"{left_name} left the table")
                 if next_turn_player:
                     await send_hand(next_turn_player)
+                elif len(room.players) < 2:
+                    # the round was abandoned — everybody's hand just emptied
+                    for p in room.players.values():
+                        await send_hand(p)
                 await send_json(websocket, {"type": "left_ok"})
                 await websocket.close()
                 return
@@ -928,6 +927,11 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                     await broadcast_state(room)
                     await broadcast_peers(room)
 
+            elif mtype == "chat":
+                text = (msg.get("text") or "").strip()
+                if text:
+                    await broadcast_chat(room, player, text[:240])
+
             elif mtype == "ping":
                 await send_json(websocket, {"type": "pong"})
 
@@ -954,6 +958,15 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+# The client is a single-page app with no build step, so a stale cached
+# script is indistinguishable from a broken feature. Nothing here is worth
+# caching across reloads.
+NO_CACHE = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
 
 @app.get("/")
 async def index():
@@ -963,7 +976,23 @@ async def index():
             {"ok": False, "error": f"No index.html found. Put the HTML file at: {index_path}"},
             status_code=404,
         )
-    return FileResponse(index_path, headers={"Cache-Control": "no-cache"})
+    return FileResponse(index_path, headers=NO_CACHE)
+
+
+@app.get("/style.css")
+async def style_css():
+    css_path = STATIC_DIR / "style.css"
+    if not css_path.exists():
+        return JSONResponse({"ok": False, "error": "style.css not found"}, status_code=404)
+    return FileResponse(css_path, media_type="text/css", headers=NO_CACHE)
+
+
+@app.get("/app.js")
+async def app_js():
+    js_path = STATIC_DIR / "app.js"
+    if not js_path.exists():
+        return JSONResponse({"ok": False, "error": "app.js not found"}, status_code=404)
+    return FileResponse(js_path, media_type="application/javascript", headers=NO_CACHE)
 
 
 @app.get("/api/ice-config")
@@ -973,16 +1002,23 @@ async def ice_config() -> JSONResponse:
     TURN is a relay used when a direct connection is impossible (strict
     NATs, symmetric NAT, phone-on-cellular ↔ laptop-on-WiFi, etc.).
 
-    For reliable cross-network video you should run a TURN server. The
-    bundled `docker-compose.yml` starts `coturn` for you; just set the
-    matching env vars in `.env`:
+    For FLAWLESS cross-network video you MUST run a TURN server. The
+    easiest option is `coturn` on the same Proxmox CT103 host:
 
-        TURN_URL=turn:<public-ip-or-host>:3478
+        # on ct103 (Debian/Ubuntu)
+        apt-get install coturn
+        turnserver -a -o -v --no-loopback-peers \
+            --listening-port=3478 --tls-listening-port=5349 \
+            --relay-ip=<CT103_LAN_IP> --external-ip=<CT103_PUBLIC_IP> \
+            --user=uno:STRONG_PASSWORD --lt-cred-mech --realm=uno.local
+
+    Then launch this server with the matching env vars:
+        TURN_URL=turn:CT103_LAN_IP:3478
         TURN_USERNAME=uno
-        TURN_CREDENTIAL=<strong-password>
+        TURN_CREDENTIAL=STRONG_PASSWORD
 
-    A TURN-over-TCP/TLS variant is added automatically as a fallback for
-    networks that block UDP. See `docs/deployment.md` for details.
+    (If CT103 is behind a NAT/router, also forward UDP 3478/5349 and set
+    --external-ip to the public IP, or use a TURN-over-TCP/TLS fallback.)
     """
     servers = [
         {"urls": "stun:stun.l.google.com:19302"},

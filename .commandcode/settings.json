@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "powershell",
+      "mcp__figma__figma_get_file_data",
+      "mcp__figma__figma_get_status",
+      "mcp__figma__figma_get_component_image",
+      "mcp__figma__figma_get_component_for_development"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

@@ -16,3 +16,8 @@ services:
       MAX_ROOMS: ${MAX_ROOMS:-200}
     ports:
       - "8899:8899"
+    # Serve the app code straight off the host so edits go live without a
+    # rebuild. Both paths are baked into the image, so both must be mounted.
+    volumes:
+      - ./static:/app/static:ro
+      - ./server.py:/app/server.py:ro

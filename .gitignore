@@ -1,16 +1,25 @@
 # Python
 __pycache__/
-*.py[cod]
-.venv/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
 venv/
+.venv/
+env/
 
-# Environment / secrets
+# Secrets
 .env
+.env.*
 
-# Tooling / editor
-.commandcode/
-.pytest_cache/
-.ruff_cache/
-.idea/
+# Logs
+*.log
+
+# IDE
 .vscode/
+.idea/
+
+# OS
 .DS_Store
+Thumbs.db
