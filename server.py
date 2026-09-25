@@ -1144,6 +1144,10 @@ def generate_cloudflare_turn_credentials(
         headers={
             "Authorization": f"Bearer {turn_key}",
             "Content-Type": "application/json",
+            # Cloudflare's edge rejects Python's default urllib User-Agent with
+            # HTTP 403 / error code 1010 (a browser-signature block) before the
+            # request ever reaches the TURN API. An explicit UA avoids that.
+            "User-Agent": "uno-server/1.0 (+https://github.com/jrush-vj/uno)",
         },
         method="POST",
     )

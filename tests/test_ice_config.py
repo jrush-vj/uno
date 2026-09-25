@@ -89,6 +89,9 @@ class IceConfigTests(unittest.TestCase):
         )
         self.assertEqual(request.get_header("Authorization"), "Bearer turn-key-secret")
         self.assertEqual(json.loads(request.data), {"ttl": 3600})
+        # Cloudflare's edge blocks urllib's default User-Agent with HTTP 403 /
+        # error 1010, so an explicit UA must always be sent.
+        self.assertTrue(request.get_header("User-agent"))
         self.assertEqual(servers[1]["urls"], [
             "turn:turn.cloudflare.com:3478?transport=udp",
             "turns:turn.cloudflare.com:443?transport=tcp",
