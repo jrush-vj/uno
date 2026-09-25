@@ -52,6 +52,8 @@ import random
 import re
 import time
 import uuid
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -188,6 +190,23 @@ class Room:
 
 rooms: dict[str, Room] = {}
 _rooms_guard = asyncio.Lock()
+TURN_CREDENTIAL_REQUEST_LIMIT = 12
+TURN_CREDENTIAL_REQUEST_WINDOW = 60
+_turn_credential_requests: dict[str, list[float]] = {}
+
+
+def allow_turn_credential_request(client_ip: str, now: Optional[float] = None) -> bool:
+    current_time = time.time() if now is None else now
+    recent = [
+        timestamp for timestamp in _turn_credential_requests.get(client_ip, [])
+        if current_time - timestamp < TURN_CREDENTIAL_REQUEST_WINDOW
+    ]
+    if len(recent) >= TURN_CREDENTIAL_REQUEST_LIMIT:
+        _turn_credential_requests[client_ip] = recent
+        return False
+    recent.append(current_time)
+    _turn_credential_requests[client_ip] = recent
+    return True
 
 
 async def get_or_create_room(room_id: str) -> Room:
@@ -1073,14 +1092,7 @@ async def app_js():
     return FileResponse(js_path, media_type="application/javascript", headers=NO_CACHE)
 
 
-def build_ice_servers(
-    turn_url: Optional[str],
-    turn_shared_secret: Optional[str],
-    turn_ttl_seconds: int = 3600,
-    now: Optional[int] = None,
-) -> list[dict]:
-    """Build public STUN plus optional short-lived coturn REST credentials."""
-    servers = [
+PUBLIC_STUN_SERVERS = [
         {"urls": "stun:stun.l.google.com:19302"},
         {"urls": "stun:stun1.l.google.com:19302"},
         {"urls": "stun:stun2.l.google.com:19302"},
@@ -1090,49 +1102,184 @@ def build_ice_servers(
         {"urls": "stun:global.stun.twilio.com:3478"},
         {"urls": "stun:stun.services.mozilla.com"},
     ]
-    if not turn_url or not turn_shared_secret:
+
+
+def _without_known_blocked_turn_urls(ice_servers: list[dict]) -> list[dict]:
+    """Drop Cloudflare's documented browser-incompatible alternate port 53."""
+    filtered = []
+    for server in ice_servers:
+        urls = server.get("urls", [])
+        if isinstance(urls, str):
+            urls = [urls]
+        urls = [url for url in urls if ":53?" not in url and not url.endswith(":53")]
+        if urls:
+            filtered.append({**server, "urls": urls})
+    return filtered
+
+
+def generate_cloudflare_turn_credentials(
+    turn_key_id: str,
+    turn_key: str,
+    ttl_seconds: int = 86400,
+    timeout_seconds: float = 8,
+) -> list[dict]:
+    """Ask Cloudflare Realtime TURN for short-lived credentials.
+
+    The TURN key and TURN key ID stay on the server. Only the returned
+    expiring ICE credentials are sent to the browser.
+    """
+    ttl = max(60, min(int(ttl_seconds), 86400))
+    endpoint = (
+        "https://rtc.live.cloudflare.com/v1/turn/keys/"
+        f"{turn_key_id}/credentials/generate-ice-servers"
+    )
+    payload = json.dumps({"ttl": ttl}).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {turn_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    ice_servers = result.get("iceServers")
+    if not isinstance(ice_servers, list) or not ice_servers:
+        raise ValueError("Cloudflare TURN returned no ICE servers")
+    return _without_known_blocked_turn_urls(ice_servers)
+
+
+def _turn_url_variants(turn_url: str) -> list[str]:
+    """Expand a coturn URL into UDP/TCP plus TURN-over-TLS fallbacks.
+
+    Restrictive networks (college Wi-Fi, some mobile carriers) block UDP, so
+    offering the TCP and TLS transports lets the relay stay usable there.
+    Duplicates are removed so a two-URL input does not list the same endpoint
+    twice.
+    """
+    base = turn_url.split("?")[0]
+    if not base.startswith("turn:"):
+        return [turn_url]
+
+    if "transport=" in turn_url:
+        variants = [turn_url]
+    else:
+        variants = [f"{base}?transport=udp", f"{base}?transport=tcp"]
+
+    # TURN over TLS uses the conventional 5349 port; TLS already implies TCP,
+    # so no transport parameter is needed on this URL.
+    tls_base = base.replace("turn:", "turns:", 1)
+    if ":3478" in tls_base:
+        tls_base = tls_base.replace(":3478", ":5349", 1)
+    variants.append(tls_base)
+
+    unique: list[str] = []
+    for variant in variants:
+        if variant not in unique:
+            unique.append(variant)
+    return unique
+
+
+def build_ice_servers(
+    turn_url: Optional[str],
+    turn_shared_secret: Optional[str] = None,
+    turn_ttl_seconds: int = 3600,
+    now: Optional[int] = None,
+    turn_username: Optional[str] = None,
+    turn_credential: Optional[str] = None,
+) -> list[dict]:
+    """Build public STUN plus optional TURN entries.
+
+    Two credential styles are supported so any free relay can be used:
+
+    * **Static** (`turn_username` + `turn_credential`) — a long-lived
+      username/password pair, which is what most free/self-hosted TURN
+      services issue. Credentials come from the server environment and are
+      handed to the browser because the browser is the TURN client.
+    * **coturn REST** (`turn_shared_secret`) — time-limited HMAC credentials
+      derived from a shared secret that never leaves the server.
+    """
+    servers = list(PUBLIC_STUN_SERVERS)
+    if not turn_url:
         return servers
 
-    ttl = max(60, min(int(turn_ttl_seconds), 86400))
-    expiry = (int(time.time()) if now is None else now) + ttl
-    identity = os.environ.get("TURN_USERNAME", "uno")
-    username = f"{expiry}:{identity}"
-    digest = hmac.new(
-        turn_shared_secret.encode("utf-8"), username.encode("utf-8"), hashlib.sha1
-    ).digest()
-    credential = base64.b64encode(digest).decode("ascii")
+    if turn_credential and turn_shared_secret is None:
+        username = turn_username or "uno"
+        credential = turn_credential
+    elif turn_shared_secret:
+        ttl = max(60, min(int(turn_ttl_seconds), 86400))
+        expiry = (int(time.time()) if now is None else now) + ttl
+        identity = turn_username or os.environ.get("TURN_USERNAME", "uno")
+        username = f"{expiry}:{identity}"
+        digest = hmac.new(
+            turn_shared_secret.encode("utf-8"), username.encode("utf-8"), hashlib.sha1
+        ).digest()
+        credential = base64.b64encode(digest).decode("ascii")
+    else:
+        return servers
 
-    urls = [url.strip() for url in turn_url.split(",") if url.strip()]
+    urls: list[str] = []
+    for part in (segment.strip() for segment in turn_url.split(",") if segment.strip()):
+        for variant in _turn_url_variants(part):
+            if variant not in urls:
+                urls.append(variant)
+
     for url in urls:
-        servers.append({"urls": url, "username": username, "credential": credential})
-        # Offer TURN/TLS on the conventional coturn port when UDP/TCP TURN is
-        # configured on 3478. The relay can then work on restrictive networks.
-        if url.startswith("turn:") and ":3478" in url and "?transport=tcp" in url:
-            tls_url = url.replace("turn:", "turns:", 1).replace(":3478", ":5349", 1)
-            tls_url = tls_url.replace("?transport=tcp", "")
-            servers.append({
-                "urls": tls_url,
-                "username": username,
-                "credential": credential,
-            })
+        servers.append({
+            "urls": url,
+            "username": username,
+            "credential": credential,
+        })
     return servers
 
 
 @app.get("/api/ice-config")
-async def ice_config() -> JSONResponse:
+async def ice_config(request: Request) -> JSONResponse:
     """Returns the ICE servers the browser uses to establish WebRTC
     peer connections. STUN helps peers discover their public address;
     TURN is a relay used when a direct connection is impossible (strict
     NATs, symmetric NAT, phone-on-cellular ↔ laptop-on-WiFi, etc.).
 
-    TURN credentials use coturn's REST shared-secret scheme. The shared
-    secret stays server-side; browsers receive HMAC-SHA1 credentials that
-    expire after TURN_TTL_SECONDS. Do not use a permanent TURN password here.
+    Cloudflare TURN credentials are generated server-side and expire. The
+    Cloudflare API token and TURN key ID must never be sent to the browser.
+    Coturn REST credentials remain available for self-hosted relays.
     """
+    cloudflare_key_id = os.environ.get("CLOUDFLARE_TURN_KEY_ID")
+    cloudflare_turn_key = os.environ.get("CLOUDFLARE_TURN_KEY")
+    if cloudflare_key_id and cloudflare_turn_key:
+        client_ip = request.headers.get("CF-Connecting-IP")
+        if not client_ip:
+            client_ip = request.client.host if request.client else "unknown"
+        if not allow_turn_credential_request(client_ip):
+            return JSONResponse(
+                {"error": "Too many TURN credential requests"},
+                status_code=429,
+                headers={"Cache-Control": "no-store", "Retry-After": "60"},
+            )
+        try:
+            servers = await asyncio.to_thread(
+                generate_cloudflare_turn_credentials,
+                cloudflare_key_id,
+                cloudflare_turn_key,
+                int(os.environ.get("TURN_TTL_SECONDS", "86400")),
+            )
+            return JSONResponse(servers, headers={"Cache-Control": "no-store"})
+        except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            log.error("Cloudflare TURN credential request failed: %s", exc)
+            return JSONResponse(
+                {"error": "TURN credentials temporarily unavailable"},
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
+
     servers = build_ice_servers(
         turn_url=os.environ.get("TURN_URL"),
         turn_shared_secret=os.environ.get("TURN_SHARED_SECRET"),
         turn_ttl_seconds=int(os.environ.get("TURN_TTL_SECONDS", "3600")),
+        turn_username=os.environ.get("TURN_USERNAME"),
+        turn_credential=os.environ.get("TURN_CREDENTIAL"),
     )
     return JSONResponse(servers, headers={"Cache-Control": "no-store"})
 

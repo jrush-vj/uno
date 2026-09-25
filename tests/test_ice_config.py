@@ -4,17 +4,19 @@ import hmac
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from unittest.mock import patch
 
 from server import (
     Player,
     Room,
+    allow_turn_credential_request,
     app,
     broadcast_peers,
     build_ice_servers,
     can_kick_player,
+    generate_cloudflare_turn_credentials,
     leave_on_page_exit,
     public_state,
     rooms,
@@ -39,20 +41,92 @@ class IceConfigTests(unittest.TestCase):
             if server["urls"].startswith(("turn:", "turns:"))
         ]
 
-        self.assertEqual(len(turn_servers), 3)
         username = "1600:uno"
         expected = base64.b64encode(
             hmac.new(b"test-shared-secret", username.encode(), hashlib.sha1).digest()
         ).decode("ascii")
         self.assertTrue(all(server["username"] == username for server in turn_servers))
         self.assertTrue(all(server["credential"] == expected for server in turn_servers))
-        self.assertEqual(turn_servers[-1]["urls"], "turns:turn.example.test:5349")
+        turn_urls = [server["urls"] for server in turn_servers]
+        self.assertEqual(set(turn_urls), {
+            "turn:turn.example.test:3478?transport=udp",
+            "turn:turn.example.test:3478?transport=tcp",
+            "turns:turn.example.test:5349",
+        })
 
     def test_turn_ttl_is_bounded(self):
         servers = build_ice_servers("turn:turn.example.test:3478", "secret", 999999, now=1000)
         turn_server = next(server for server in servers if server["urls"].startswith("turn:"))
 
         self.assertEqual(turn_server["username"], "87400:uno")
+
+    def test_cloudflare_credentials_are_short_lived_and_filter_port_53(self):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = json.dumps({
+            "iceServers": [
+                {"urls": ["stun:stun.cloudflare.com:3478"]},
+                {
+                    "urls": [
+                        "turn:turn.cloudflare.com:3478?transport=udp",
+                        "turn:turn.cloudflare.com:53?transport=udp",
+                        "turns:turn.cloudflare.com:443?transport=tcp",
+                    ],
+                    "username": "temporary-user",
+                    "credential": "temporary-credential",
+                },
+            ]
+        }).encode()
+
+        with patch("server.urllib.request.urlopen", return_value=response) as urlopen:
+            servers = generate_cloudflare_turn_credentials("turn-key-uid", "turn-key-secret", 3600)
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            "https://rtc.live.cloudflare.com/v1/turn/keys/turn-key-uid/credentials/generate-ice-servers",
+        )
+        self.assertEqual(request.get_header("Authorization"), "Bearer turn-key-secret")
+        self.assertEqual(json.loads(request.data), {"ttl": 3600})
+        self.assertEqual(servers[1]["urls"], [
+            "turn:turn.cloudflare.com:3478?transport=udp",
+            "turns:turn.cloudflare.com:443?transport=tcp",
+        ])
+
+    def test_cloudflare_turn_request_rate_limit(self):
+        from server import _turn_credential_requests
+
+        _turn_credential_requests.clear()
+        for request_index in range(12):
+            self.assertTrue(allow_turn_credential_request("test-client", now=1000 + request_index))
+        self.assertFalse(allow_turn_credential_request("test-client", now=1012))
+        self.assertTrue(allow_turn_credential_request("test-client", now=1061))
+
+    def test_static_turn_credentials_are_served_for_free_relays(self):
+        servers = build_ice_servers(
+            "turn:free.example.test:3478",
+            None,
+            turn_username="free-user",
+            turn_credential="free-password",
+        )
+        turn_servers = [
+            server for server in servers
+            if any(
+                "turn" in url
+                for url in (
+                    server["urls"] if isinstance(server["urls"], list) else [server["urls"]]
+                )
+            )
+        ]
+
+        self.assertTrue(turn_servers)
+        self.assertTrue(all(server["username"] == "free-user" for server in turn_servers))
+        self.assertTrue(all(server["credential"] == "free-password" for server in turn_servers))
+        urls = [server["urls"] for server in turn_servers]
+        self.assertIn("turn:free.example.test:3478?transport=udp", urls)
+        self.assertIn("turn:free.example.test:3478?transport=tcp", urls)
+        self.assertIn("turns:free.example.test:5349", urls)
 
 
 class PublicStateSecurityTests(unittest.TestCase):

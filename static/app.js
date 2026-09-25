@@ -397,9 +397,56 @@ function updateSeatToSlotMapping(seats) {
 async function loadIceConfiguration() {
   try {
     const res = await fetch('/api/ice-config');
-    if (res.ok) iceServers = await res.json();
-  } catch(e) {}
+    if (!res.ok) throw new Error(`ICE config returned HTTP ${res.status}`);
+    iceServers = await res.json();
+    const turnCount = iceServers.filter(server => {
+      const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+      return urls.some(url => url.startsWith('turn:') || url.startsWith('turns:'));
+    }).length;
+    debugLog(`ice:loaded turnEntries=${turnCount}`);
+    if (!turnCount) {
+      console.warn('[WebRTC] No TURN relay configured; some networks may not connect media.');
+    }
+  } catch(e) {
+    console.error('[WebRTC] Could not load ICE configuration:', e);
+  }
 }
+
+/* Diagnostics: run unoDebug() in the browser console during a call to see
+   why media is or is not flowing. Everything it reads is local state. */
+const debugLines = [];
+function debugLog(message) {
+  const line = `${new Date().toISOString()} ${message}`;
+  debugLines.push(line);
+  if (debugLines.length > 200) debugLines.shift();
+}
+window.unoDebug = async () => {
+  const peers = [];
+  for (const [peerToken, entry] of Object.entries(peerConnections)) {
+    const report = {
+      seat: entry.seat,
+      signalingState: entry.pc.signalingState,
+      iceConnectionState: entry.pc.iceConnectionState,
+      connectionState: entry.pc.connectionState,
+      sendVideo: !!entry.senders.video?.track,
+      sendAudio: !!entry.senders.audio?.track,
+      remoteTracks: (remoteStreams[entry.seat]?.getTracks() || []).map(t => `${t.kind}:${t.readyState}`),
+      selectedCandidatePair: null,
+    };
+    try {
+      const stats = await entry.pc.getStats();
+      stats.forEach(stat => {
+        if (stat.type === 'candidate-pair' && stat.state === 'succeeded') {
+          const local = stats.get(stat.localCandidateId);
+          const remote = stats.get(stat.remoteCandidateId);
+          report.selectedCandidatePair = `${local?.candidateType || '?'} -> ${remote?.candidateType || '?'}`;
+        }
+      });
+    } catch(e) {}
+    peers.push(report);
+  }
+  return { iceServers, peers, log: debugLines.slice(-60) };
+};
 
 function getWebSocketUrl(room) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -1454,6 +1501,7 @@ function createPeerConnection(peerToken, seatNum) {
   };
   peerConnections[peerToken] = entry;
   refreshLocalTracksOnPeer(entry);
+  debugLog(`pc:create seat=${seatNum} polite=${isPolite} hasLocalVideo=${!!(localStream && localStream.getVideoTracks().length)}`);
 
   pc.onnegotiationneeded = async () => {
     try {
@@ -1493,6 +1541,7 @@ function createPeerConnection(peerToken, seatNum) {
       const localTrackIds = new Set(localStream.getTracks().map(t => t.id));
       if (localTrackIds.has(ev.track.id)) return;
     }
+    debugLog(`pc:ontrack seat=${seatNum} kind=${ev.track.kind} readyState=${ev.track.readyState} streams=${ev.streams.length}`);
 
     let stream = remoteStreams[seatNum];
     if (!stream) {
@@ -1511,6 +1560,7 @@ function createPeerConnection(peerToken, seatNum) {
 
   pc.oniceconnectionstatechange = () => {
     const s = pc.iceConnectionState;
+    debugLog(`pc:ice seat=${seatNum} state=${s}`);
     if (s === 'connected' || s === 'completed') {
       entry.lastConnectedAt = Date.now();
       if (entry.restartTimer) { clearTimeout(entry.restartTimer); entry.restartTimer = null; }
@@ -1526,6 +1576,7 @@ function createPeerConnection(peerToken, seatNum) {
 
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
+    debugLog(`pc:connection seat=${seatNum} state=${s}`);
     if (s === 'connected') {
       if (remoteStreams[seatNum]) {
         attachRemoteStreamToSeat(seatNum, remoteStreams[seatNum]);
