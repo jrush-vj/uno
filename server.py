@@ -42,6 +42,9 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -135,6 +138,7 @@ def build_deck() -> list[dict]:
 @dataclass
 class Player:
     token: str
+    peer_id: str
     seat: int
     name: str
     ws: Optional[WebSocket] = None
@@ -547,7 +551,6 @@ def public_state(room: Room) -> dict:
         p = room.player_by_seat(s)
         if p:
             seats[str(s)] = {
-                "token": p.token,
                 "name": p.name,
                 "hand_count": len(p.hand),
                 "connected": p.connected,
@@ -599,7 +602,7 @@ async def broadcast_peers(room: Room) -> None:
     """
     peers = [
         {
-            "token": p.token,
+            "peer_id": p.peer_id,
             "seat": p.seat,
             "name": p.name,
             "cam_on": p.cam_on,
@@ -764,6 +767,7 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                     if existing is not None:
                         player = existing
                         player.ws = websocket
+                        player.peer_id = uuid.uuid4().hex
                         player.connected = True
                         player.last_seen = time.time()
                         if name:
@@ -778,7 +782,13 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                             await websocket.close()
                             return
                         new_token = uuid.uuid4().hex
-                        player = Player(token=new_token, seat=seat, name=name, ws=websocket)
+                        player = Player(
+                            token=new_token,
+                            peer_id=uuid.uuid4().hex,
+                            seat=seat,
+                            name=name,
+                            ws=websocket,
+                        )
                         room.players[new_token] = player
                         is_new_player = True
                         if room.host_token is None:
@@ -792,6 +802,7 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                     await send_json(websocket, {
                         "type": "joined",
                         "token": player.token,
+                        "peer_id": player.peer_id,
                         "seat": player.seat,
                         "room": room_id,
                     })
@@ -903,11 +914,15 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
 
             # ---- WebRTC signaling relay ----------------------------------
             elif mtype == "webrtc":
-                target = room.players.get(msg.get("target"))
+                target_peer_id = msg.get("target")
+                target = next(
+                    (p for p in room.players.values() if p.peer_id == target_peer_id),
+                    None,
+                )
                 if target and target.connected:
                     await send_json(target.ws, {
                         "type": "webrtc",
-                        "from": player.token,
+                        "from": player.peer_id,
                         "from_seat": player.seat,
                         "payload": msg.get("payload"),
                     })
@@ -995,31 +1010,13 @@ async def app_js():
     return FileResponse(js_path, media_type="application/javascript", headers=NO_CACHE)
 
 
-@app.get("/api/ice-config")
-async def ice_config() -> JSONResponse:
-    """Returns the ICE servers the browser uses to establish WebRTC
-    peer connections. STUN helps peers discover their public address;
-    TURN is a relay used when a direct connection is impossible (strict
-    NATs, symmetric NAT, phone-on-cellular ↔ laptop-on-WiFi, etc.).
-
-    For FLAWLESS cross-network video you MUST run a TURN server. The
-    easiest option is `coturn` on the same Proxmox CT103 host:
-
-        # on ct103 (Debian/Ubuntu)
-        apt-get install coturn
-        turnserver -a -o -v --no-loopback-peers \
-            --listening-port=3478 --tls-listening-port=5349 \
-            --relay-ip=<CT103_LAN_IP> --external-ip=<CT103_PUBLIC_IP> \
-            --user=uno:STRONG_PASSWORD --lt-cred-mech --realm=uno.local
-
-    Then launch this server with the matching env vars:
-        TURN_URL=turn:CT103_LAN_IP:3478
-        TURN_USERNAME=uno
-        TURN_CREDENTIAL=STRONG_PASSWORD
-
-    (If CT103 is behind a NAT/router, also forward UDP 3478/5349 and set
-    --external-ip to the public IP, or use a TURN-over-TCP/TLS fallback.)
-    """
+def build_ice_servers(
+    turn_url: Optional[str],
+    turn_shared_secret: Optional[str],
+    turn_ttl_seconds: int = 3600,
+    now: Optional[int] = None,
+) -> list[dict]:
+    """Build public STUN plus optional short-lived coturn REST credentials."""
     servers = [
         {"urls": "stun:stun.l.google.com:19302"},
         {"urls": "stun:stun1.l.google.com:19302"},
@@ -1030,22 +1027,51 @@ async def ice_config() -> JSONResponse:
         {"urls": "stun:global.stun.twilio.com:3478"},
         {"urls": "stun:stun.services.mozilla.com"},
     ]
-    # Optional TURN relay (strongly recommended for phone↔laptop).
-    turn_url = os.environ.get("TURN_URL")
-    if turn_url:
-        entry: dict = {"urls": turn_url}
-        if os.environ.get("TURN_USERNAME"):
-            entry["username"] = os.environ["TURN_USERNAME"]
-        if os.environ.get("TURN_CREDENTIAL"):
-            entry["credential"] = os.environ["TURN_CREDENTIAL"]
-        # Also allow TURN over TCP/TLS as a fallback when UDP is blocked.
-        tcp_variant = turn_url.replace("turn:", "turns:").replace(":3478", ":5349")
-        if tcp_variant != turn_url:
-            tcp_entry = dict(entry)
-            tcp_entry["urls"] = tcp_variant
-            servers.append(tcp_entry)
-        servers.append(entry)
-    return JSONResponse(servers, headers={"Cache-Control": "public, max-age=60"})
+    if not turn_url or not turn_shared_secret:
+        return servers
+
+    ttl = max(60, min(int(turn_ttl_seconds), 86400))
+    expiry = (int(time.time()) if now is None else now) + ttl
+    identity = os.environ.get("TURN_USERNAME", "uno")
+    username = f"{expiry}:{identity}"
+    digest = hmac.new(
+        turn_shared_secret.encode("utf-8"), username.encode("utf-8"), hashlib.sha1
+    ).digest()
+    credential = base64.b64encode(digest).decode("ascii")
+
+    urls = [url.strip() for url in turn_url.split(",") if url.strip()]
+    for url in urls:
+        servers.append({"urls": url, "username": username, "credential": credential})
+        # Offer TURN/TLS on the conventional coturn port when UDP/TCP TURN is
+        # configured on 3478. The relay can then work on restrictive networks.
+        if url.startswith("turn:") and ":3478" in url and "?transport=tcp" in url:
+            tls_url = url.replace("turn:", "turns:", 1).replace(":3478", ":5349", 1)
+            tls_url = tls_url.replace("?transport=tcp", "")
+            servers.append({
+                "urls": tls_url,
+                "username": username,
+                "credential": credential,
+            })
+    return servers
+
+
+@app.get("/api/ice-config")
+async def ice_config() -> JSONResponse:
+    """Returns the ICE servers the browser uses to establish WebRTC
+    peer connections. STUN helps peers discover their public address;
+    TURN is a relay used when a direct connection is impossible (strict
+    NATs, symmetric NAT, phone-on-cellular ↔ laptop-on-WiFi, etc.).
+
+    TURN credentials use coturn's REST shared-secret scheme. The shared
+    secret stays server-side; browsers receive HMAC-SHA1 credentials that
+    expire after TURN_TTL_SECONDS. Do not use a permanent TURN password here.
+    """
+    servers = build_ice_servers(
+        turn_url=os.environ.get("TURN_URL"),
+        turn_shared_secret=os.environ.get("TURN_SHARED_SECRET"),
+        turn_ttl_seconds=int(os.environ.get("TURN_TTL_SECONDS", "3600")),
+    )
+    return JSONResponse(servers, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/health")

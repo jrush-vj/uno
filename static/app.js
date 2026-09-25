@@ -475,9 +475,9 @@ function stopKeepAlivePing() {
 function handleServerMessage(msg) {
   switch (msg.type) {
     case 'joined': {
-      myToken = msg.token;
+      myToken = msg.peer_id;
       mySeat = msg.seat;
-      localStorage.setItem(`uno_token_${myRoom}`, myToken);
+      localStorage.setItem(`uno_token_${myRoom}`, msg.token);
       localStorage.setItem('uno_last_room', myRoom);
       hideReconnectOverlay();
       lobby.classList.add('hidden');
@@ -1375,14 +1375,14 @@ function getLocalMediaStream() {
 }
 
 function syncPeerConnections(peerList) {
-  const activeTokens = new Set(peerList.map(p => p.token).filter(t => t !== myToken));
+  const activeTokens = new Set(peerList.map(p => p.peer_id).filter(t => t !== myToken));
   peerList.forEach(p => {
-    if (p.token !== myToken && !peerConnections[p.token]) {
-      const pcEntry = createPeerConnection(p.token, p.seat);
-      if (myToken > p.token) {
+    if (p.peer_id !== myToken && !peerConnections[p.peer_id]) {
+      const pcEntry = createPeerConnection(p.peer_id, p.seat);
+      if (myToken > p.peer_id) {
         setTimeout(() => {
           if (pcEntry && pcEntry.pc.signalingState === 'stable' && !pcEntry.makingOffer) {
-            forceRenegotiate(p.token);
+            forceRenegotiate(p.peer_id);
           }
         }, 100);
       }
