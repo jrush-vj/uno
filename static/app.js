@@ -1646,12 +1646,10 @@ function cleanupSessionLocal() {
   centreSeats.innerHTML = '';
   Object.keys(centreSeatEls).forEach(k => delete centreSeatEls[k]);
 
-  liveSeats.forEach(seatNum => {
-    const pod = opponentPod(seatNum);
-    if (pod) renderOpponentFan(pod, 0);
-  });
-  /* Tear down every generated seat tile too, or a stale tile from the last
-     game would linger when a new room is opened. */
+  /* Every generated seat tile is torn down here, which also clears its card
+     fan and detaches its media. Doing this by iterating the live tiles (not
+     a local list from the deal animation) keeps a stale tile from the last
+     game from lingering into the next one. */
   setArranging(false);
   pruneSeatNodes(new Set());
   closeDeviceMenu();

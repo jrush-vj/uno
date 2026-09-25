@@ -1670,7 +1670,10 @@ async def health() -> JSONResponse:
         "ok": True,
         "rooms": {rid: len(r.players) for rid, r in rooms.items()},
         "active_codes": await registry.active_count(),
-        "redis": await registry.healthy(),
+        # Report the backend actually in use, not merely "healthy" — the
+        # in-memory fallback is healthy too, so a bare boolean was misleading.
+        "storage": type(registry).__name__,
+        "storage_url_configured": bool(os.environ.get("REDIS_URL")),
     })
 
 
