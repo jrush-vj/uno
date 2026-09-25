@@ -392,20 +392,19 @@ requestAnimationFrame(audioMeterLoop);
 
 /* ------------------------------------------------------------- seating ---
    Opponent tiles are generated, not fixed. Each seated opponent gets a tile
-   placed on an arc around the table, measured from the bottom-centre (where
-   "my" tile sits) clockwise, so any count from 1 to 5 is symmetric:
+   placed on an arc across the *upper* half of the play area, measured from
+   the left edge (180deg) to the right edge (0deg), so the group is always
+   centred on the vertical axis above "my" tile at the bottom:
 
      1 opponent  -> directly opposite
-     2 opponents -> opposite-left and opposite-right
+     2 opponents -> mirrored left and right
      3 opponents -> adds the top-centre
-     4 opponents -> four evenly spaced
-     5 opponents -> five evenly spaced
+     4-5         -> evenly spread
 
-   Position is expressed as a percentage of the table area, and the tile size
-   shrinks a little as the count grows so the centre stays visible.
-
-   Only real players get a tile: there are no "Open Seat" placeholders, which
-   is what the previous fixed left/top/right slots drew.
+   The arc is computed in pixels from the measured layer and tile sizes and
+   clamped inside the play area, because percentage-only placement clipped
+   tiles at some window sizes. Only real players get a tile: there are no
+   "Open Seat" placeholders.
 */
 const SEAT_LAYER = $('seatLayer');
 const SEAT_TEMPLATE = $('seatTemplate');
@@ -413,27 +412,8 @@ const SEAT_TEMPLATE = $('seatTemplate');
 /* One entry per seated opponent, keyed by seat number. */
 const seatNodes = new Map();
 
-/* Opponents are spread across the upper semicircle, measured from the left
-   edge (180deg) to the right edge (0deg), so the group is always centred on
-   the vertical axis above "my" tile at the bottom. Verified positions:
-
-     1 opponent  -> [[50,12]]                          (directly opposite)
-     2 opponents -> [[28,17],[72,17]]                  (mirrored)
-     3 opponents -> [[19,23],[50,12],[81,23]]          (adds top-centre)
-     4 opponents -> [[14,28],[36,14],[64,14],[86,28]]
-     5 opponents -> [[12,31],[28,17],[50,12],[72,17],[88,31]]
-
-   The radius is wider horizontally than vertically because the stage is
-   wider than it is tall, which keeps the tiles visually equidistant rather
-   than merely mathematically so. */
-function seatArcPosition(index, total) {
-  const angle = (180 - (180 * (index + 1)) / (total + 1)) * (Math.PI / 180);
-  return {
-    left: 50 + 44 * Math.cos(angle),
-    top: 50 - 38 * Math.sin(angle),
-  };
-}
-
+/* How much to shrink opponent tiles as the table fills, so the ring stays
+   inside the play area and the centre is left clear. */
 function seatTileScale(total) {
   if (total <= 2) return 1;
   if (total === 3) return 0.92;
@@ -470,16 +450,60 @@ function pruneSeatNodes(activeSeats) {
   }
 }
 
-/* Position every tile, and size them for the current count. */
+/* Positions are computed in pixels from the *measured* layer and tile size,
+   then clamped so no tile can ever hang outside the visible play area. A
+   pure-percentage arc looked fine at one window size and clipped the topmost
+   tile at others, because it ignored both the top bar and the tile height. */
 function layoutSeats(seatNumbers) {
+  if (!SEAT_LAYER || !seatNumbers.length) return;
   const scale = seatTileScale(seatNumbers.length);
+  const layerW = SEAT_LAYER.clientWidth;
+  const layerH = SEAT_LAYER.clientHeight;
+  if (!layerW || !layerH) return;
+
+  /* Measure one tile at this scale so the ring is built from real sizes
+     rather than assumed ones. */
+  seatNumbers.forEach(seatNum => {
+    const node = seatNodes.get(seatNum);
+    if (node) node.style.setProperty('--seat-scale', String(scale));
+  });
+  const sample = seatNodes.get(seatNumbers[0]);
+  const tileW = sample ? sample.offsetWidth || 120 : 120;
+  const tileH = sample ? sample.offsetHeight || 100 : 100;
+
+  /* Keep a margin so a tile never touches an edge, and reserve room below the
+     ring for the card fan that hangs under each opponent tile. The horizontal
+     inset is a little wider than the tile half-width so the outermost seats of
+     a five-opponent ring do not sit flush against the viewport edge. */
+  const marginX = tileW / 2 + Math.max(16, layerW * 0.03);
+  const marginTop = tileH / 2 + 8;
+  const marginBottom = tileH / 2 + 34;
+
+  const cx = layerW / 2;
+  const rx = Math.max(40, layerW / 2 - marginX);
+  /* The ring only occupies the upper area, so it is centred a little low to
+     leave the middle of the table clear for the piles and my hand. */
+  const ringTop = marginTop;
+  const ringBottom = Math.max(ringTop + 40, layerH - marginBottom);
+  const cy = ringTop + (ringBottom - ringTop) * 0.62;
+  const ry = Math.max(30, (ringBottom - ringTop) / 2);
+
+  const total = seatNumbers.length;
   seatNumbers.forEach((seatNum, index) => {
     const node = seatNodes.get(seatNum);
     if (!node) return;
-    const { left, top } = seatArcPosition(index, seatNumbers.length);
-    node.style.left = `${left}%`;
-    node.style.top = `${top}%`;
-    node.style.setProperty('--seat-scale', String(scale));
+    /* Spread across the upper semicircle: 180deg (left edge) to 0deg (right
+       edge), so the group is always centred above my own tile. */
+    const angle = (180 - (180 * (index + 1)) / (total + 1)) * (Math.PI / 180);
+    let x = cx + rx * Math.cos(angle);
+    let y = cy - ry * Math.sin(angle);
+
+    /* Clamp so a tile can never be clipped by the bar or a viewport edge. */
+    x = Math.min(Math.max(x, marginX), layerW - marginX);
+    y = Math.min(Math.max(y, marginTop), layerH - marginBottom);
+
+    node.style.left = `${Math.round(x)}px`;
+    node.style.top = `${Math.round(y)}px`;
     node.style.zIndex = String(10 + index);
   });
 }
@@ -675,6 +699,17 @@ function refreshSeatDraggability() {
     if (pod) pod.draggable = arrangingSeats;
   });
 }
+
+let seatResizeTimer = null;
+window.addEventListener('resize', () => {
+  /* Positions are pixel-based, so a resize invalidates them. Debounced
+     because resize fires continuously while dragging a window edge. */
+  clearTimeout(seatResizeTimer);
+  seatResizeTimer = setTimeout(() => {
+    const opponents = [...seatNodes.keys()].sort((a, b) => a - b);
+    if (opponents.length) layoutSeats(opponents);
+  }, 120);
+});
 
 function updateSeatToSlotMapping(seats) {
   if (mySeat == null) return;

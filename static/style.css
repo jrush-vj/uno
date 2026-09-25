@@ -37,6 +37,11 @@
   /* one design px of the 1920x1276 Figma frame */
   --u: min(0.0520833vw, 0.0783699vh);
 
+  /* The top bar overlays the table, so seat positions must be measured from
+     below it. Declared once here and used by both the bar and the seat
+     layer, so the two can never drift apart. */
+  --topbar-h: max(44px, calc(var(--u) * 60));
+
   /* stage anchors (percentages of the 1920x1276 frame) */
   --y-top-tile:  7.4452%;
   --y-side-tile: 38.4796%;
@@ -253,7 +258,12 @@ input { font-family: inherit; }
    ========================================================================== */
 .seat-layer {
   position: absolute;
-  inset: 0;
+  /* Starts below the top bar: the bar overlays the table, so an arc measured
+     from the top of the viewport would tuck the topmost seat under it. */
+  top: var(--topbar-h);
+  left: 0;
+  right: 0;
+  bottom: 0;
   pointer-events: none;
 }
 
@@ -738,8 +748,7 @@ input { font-family: inherit; }
   position: relative;
   flex: 0 0 auto;
   width: 100%;
-  height: calc(var(--u) * 60);
-  min-height: 44px;
+  height: var(--topbar-h);
   background: var(--bar-bg);
   box-shadow: inset 0 0.5px 0 var(--bar-stroke), inset 0 -0.5px 0 var(--bar-stroke);
   z-index: 50;
