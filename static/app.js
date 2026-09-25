@@ -171,7 +171,7 @@ const btnPlayAgain = $('btnPlayAgain');
 const btnBackToLobby = $('btnBackToLobby');
 
 /* Seats are addressed by seat number now. The generated tiles and their arc
-   positions are managed by layoutSeats() further down. */
+   positions are managed by layoutTable() further down. */
 function opponentPod(seatNum) {
   const node = seatNodes.get(Number(seatNum));
   return node ? node.querySelector('.player-pod') : null;
@@ -450,61 +450,153 @@ function pruneSeatNodes(activeSeats) {
   }
 }
 
-/* Positions are computed in pixels from the *measured* layer and tile size,
-   then clamped so no tile can ever hang outside the visible play area. A
-   pure-percentage arc looked fine at one window size and clipped the topmost
-   tile at others, because it ignored both the top bar and the tile height. */
-function layoutSeats(seatNumbers) {
-  if (!SEAT_LAYER || !seatNumbers.length) return;
-  const scale = seatTileScale(seatNumbers.length);
+/* Lays out every band of the table — the opponent ring, the centre cluster
+   and my own tile — from *measured* heights with an equal gap between them.
+
+   The original layout pinned each band to a percentage of the 1920x1276
+   reference frame. That matched the fixed four-seat frame it was drawn from,
+   but it does not survive a variable ring: measured at 1280x720 the side
+   seats of a six-seat table overlapped the turn banner by 71px, while a lone
+   opponent left a 219px void between the top bar and the piles and 9px
+   between my tile and the control bar. Equal gaps are even at every seat
+   count, and because the ring claims only the height it actually needs, the
+   leftover space is shared between the gaps rather than dumped in one place.
+
+   Vertical order, top to bottom, with the gap repeated between each band:
+
+       gap · ring · gap · centre · gap · my tile · gap
+
+   With no opponents there is no ring, so the three remaining bands take
+   three gaps and the composition stays centred instead of hugging the bar. */
+function layoutTable(seatNumbers) {
+  const myPod = $('myPodSlot');
+  const centre = $('feltTable');
+  const controls = $('controlBar');
+  if (!SEAT_LAYER || !myPod || !centre || !controls) return;
+
   const layerW = SEAT_LAYER.clientWidth;
   const layerH = SEAT_LAYER.clientHeight;
   if (!layerW || !layerH) return;
 
-  /* Measure one tile at this scale so the ring is built from real sizes
-     rather than assumed ones. */
+  /* The play area runs from just below the top bar to just above the control
+     bar, which is fixed — so the last gap is measured against the bar itself
+     rather than the bottom of the viewport. */
+  const layerTop = SEAT_LAYER.getBoundingClientRect().top;
+  const available = controls.getBoundingClientRect().top - layerTop;
+  if (available <= 0) return;
+
+  const total = seatNumbers.length;
+  const scale = seatTileScale(total);
   seatNumbers.forEach(seatNum => {
     const node = seatNodes.get(seatNum);
     if (node) node.style.setProperty('--seat-scale', String(scale));
   });
-  const sample = seatNodes.get(seatNumbers[0]);
-  const tileW = sample ? sample.offsetWidth || 120 : 120;
-  const tileH = sample ? sample.offsetHeight || 100 : 100;
 
-  /* Keep a margin so a tile never touches an edge, and reserve room below the
-     ring for the card fan that hangs under each opponent tile. The horizontal
-     inset is a little wider than the tile half-width so the outermost seats of
-     a five-opponent ring do not sit flush against the viewport edge. */
+  /* Measure one tile at this table's scale. Its height already includes the
+     card tray under it, which collapses to nothing while an opponent holds no
+     cards — so the ring grows a little when the deal lands, and the gaps stay
+     equal through the change. */
+  const sample = total ? seatNodes.get(seatNumbers[0]) : null;
+  const tileW = sample ? (sample.offsetWidth || 120) : 0;
+  const tileH = sample ? (sample.offsetHeight || 100) : 0;
+
+  /* Horizontal inset: half a tile plus a margin, so the outermost seats of a
+     full ring never sit flush against the viewport edge. */
   const marginX = tileW / 2 + Math.max(16, layerW * 0.03);
-  const marginTop = tileH / 2 + 8;
-  const marginBottom = tileH / 2 + 34;
-
-  const cx = layerW / 2;
   const rx = Math.max(40, layerW / 2 - marginX);
-  /* The ring only occupies the upper area, so it is centred a little low to
-     leave the middle of the table clear for the piles and my hand. */
-  const ringTop = marginTop;
-  const ringBottom = Math.max(ringTop + 40, layerH - marginBottom);
-  const cy = ringTop + (ringBottom - ringTop) * 0.62;
-  const ry = Math.max(30, (ringBottom - ringTop) / 2);
 
-  const total = seatNumbers.length;
+  /* One or two opponents sit at the flat ends of the arc, where rising the
+     centre would only open a hole between them and the piles; three or more
+     get a horseshoe, which is what stops a wide shallow arc from leaving the
+     middle of the table empty. */
+  const minGap = Math.max(10, Math.round(layerH * 0.015));
+  const myPodH = myPod.offsetHeight;
+  const centreH = centre.offsetHeight;
+
+  const rise = total < 3 ? 0 : Math.min(Math.round(rx * 0.42), Math.round(layerH * 0.2));
+
+  /* The arc's geometry, derived once and shared by the band height and the
+     tile placement so the two cannot disagree. Seats start one spread step
+     past the left edge: the lowest is the first (and last) seat, and the
+     highest is the seat nearest the top, which for an even count is the pair
+     straddling it rather than the top itself. */
+  const spread = total ? (180 / (total + 1)) * (Math.PI / 180) : 0;
+  const sinLow = total ? Math.sin(spread) : 0;
+  const sinPeak = total
+    ? Math.sin(total % 2 === 0 ? Math.PI / 2 - spread / 2 : Math.PI / 2)
+    : 0;
+
+  /* The arc spans sinPeak - sinLow of the rise, and every tile adds its own
+     height. Reserving a fixed band and filling only part of it is what left
+     an 80px hole above the piles at six seats while the gap above the ring
+     was 15px. */
+  const span = rise * (sinPeak - sinLow);
+  let ringH = total ? tileH + span : 0;
+  const gapCount = total ? 4 : 3;
+  let gap = Math.round((available - (ringH + centreH + myPodH)) / gapCount);
+
+  /* A tall table can be left with less space than the bands need. The arc is
+     flattened first — which shrinks its span, so this is not just a nudge —
+     and only then are the gaps run down to the floor. */
+  if (gap < minGap) {
+    const budget = Math.max(tileH, available - minGap * gapCount - centreH - myPodH);
+    ringH = budget;
+    gap = Math.max(4, Math.round((available - (ringH + centreH + myPodH)) / gapCount));
+  }
+
+  /* Walk the bands down the play area. The ring band is skipped entirely when
+     there are no opponents, so its gap is not left behind as dead space. */
+  const ringTop = gap;
+  const centreTop = total ? ringTop + ringH + gap : ringTop;
+  const myPodTop = centreTop + centreH + gap;
+
+  centre.style.top = `${Math.round(layerTop + centreTop)}px`;
+  myPod.style.top = `${Math.round(layerTop + myPodTop)}px`;
+
+  /* Nothing to place without opponents; the bands above are already centred. */
+  if (!total) return;
+
+  /* The arc's own centre line — the point the seats are measured from, which
+     is not the lowest seat: that one already sits sinLow of the rise above
+     the baseline. Placing the baseline at the *tile* instead pushed the whole
+     arc out of its band, and every tile then clamped onto the band's top
+     edge, which is what flattened the ring.
+
+     These are LAYER coordinates, like the band they come from: a seat's
+     style.top is measured from the top of the layer, not the viewport, so
+     adding the layer's own offset here would drop the whole ring by the
+     height of the top bar. */
+  const cx = layerW / 2;
+  const cy = ringTop + tileH / 2 + rise * sinPeak;
+  const yMin = ringTop + tileH / 2;
+  const yMax = ringTop + ringH - tileH / 2;
+
   seatNumbers.forEach((seatNum, index) => {
     const node = seatNodes.get(seatNum);
     if (!node) return;
     /* Spread across the upper semicircle: 180deg (left edge) to 0deg (right
        edge), so the group is always centred above my own tile. */
     const angle = (180 - (180 * (index + 1)) / (total + 1)) * (Math.PI / 180);
-    let x = cx + rx * Math.cos(angle);
-    let y = cy - ry * Math.sin(angle);
+    const x = cx + rx * Math.cos(angle);
+    const y = cy - rise * Math.sin(angle);
 
-    /* Clamp so a tile can never be clipped by the bar or a viewport edge. */
-    x = Math.min(Math.max(x, marginX), layerW - marginX);
-    y = Math.min(Math.max(y, marginTop), layerH - marginBottom);
-
-    node.style.left = `${Math.round(x)}px`;
-    node.style.top = `${Math.round(y)}px`;
+    node.style.left = `${Math.round(Math.min(Math.max(x, marginX), layerW - marginX))}px`;
+    node.style.top = `${Math.round(Math.min(Math.max(y, yMin), yMax))}px`;
     node.style.zIndex = String(10 + index);
+  });
+}
+
+/* The bands are measured, so their positions must be recomputed whenever a
+   measured height changes — a deal grows the hand, an extra opponent adds a
+   tray. Observed rather than called from every render, because the centre
+   panel and my tile are the only inputs that change without a resize. */
+if (typeof ResizeObserver === 'function') {
+  const tableObserver = new ResizeObserver(() => {
+    layoutTable([...seatNodes.keys()].sort((a, b) => a - b));
+  });
+  ['feltTable', 'myPodSlot'].forEach(id => {
+    const node = $(id);
+    if (node) tableObserver.observe(node);
   });
 }
 
@@ -706,8 +798,7 @@ window.addEventListener('resize', () => {
      because resize fires continuously while dragging a window edge. */
   clearTimeout(seatResizeTimer);
   seatResizeTimer = setTimeout(() => {
-    const opponents = [...seatNodes.keys()].sort((a, b) => a - b);
-    if (opponents.length) layoutSeats(opponents);
+    layoutTable([...seatNodes.keys()].sort((a, b) => a - b));
   }, 120);
 });
 
@@ -721,7 +812,7 @@ function updateSeatToSlotMapping(seats) {
   opponents.forEach(seatNum => {
     if (!seatNodes.has(seatNum)) buildSeatNode(seatNum);
   });
-  layoutSeats(opponents);
+  layoutTable(opponents);
   wireSeatDragging();
   refreshSeatDraggability();
 

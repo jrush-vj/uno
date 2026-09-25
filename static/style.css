@@ -42,11 +42,19 @@
      layer, so the two can never drift apart. */
   --topbar-h: max(44px, calc(var(--u) * 60));
 
-  /* stage anchors (percentages of the 1920x1276 frame) */
+  /* Floor for the vertical gap between the table bands — the opponent ring,
+     the centre cluster and my own tile. The game view recomputes those gaps
+     in pixels from the measured heights of the bands so they come out even;
+     this is the smallest gap it will settle for, and the gap the centre
+     cluster falls back to before the first measurement lands. */
+  --gap-unit: max(14px, calc(var(--u) * 24));
+
+  /* Legacy Figma tile origins, used only by the `.slot-*` labels. My own tile
+     is marked by .slot-me but positioned in pixels by layoutTable(); the
+     centre cluster is measured the same way, so it has no anchor here. */
   --y-top-tile:  7.4452%;
   --y-side-tile: 38.4796%;
   --y-host-tile: 78.1348%;
-  --y-centre:    36.5204%;
 
   /* Figma palette ------------------------------------------------------- */
   --stage:        #080808;
@@ -249,7 +257,7 @@ input { font-family: inherit; }
    SEATS — generated per opponent and placed on an arc
    --------------------------------------------------------------------------
    .seat-layer fills the table area and is the positioning context for every
-   opponent tile. Each tile is absolutely placed by layoutSeats() at a
+   opponent tile. Each tile is absolutely placed by layoutTable() at a
    percentage point on an ellipse, and --seat-scale shrinks the tile so a
    larger table still leaves the centre visible.
 
@@ -863,7 +871,9 @@ input { font-family: inherit; }
 
 .seat-slot { position: absolute; width: var(--pod-w); z-index: 8; }
 
-/* Figma tile origins, verbatim */
+/* Figma tile origins, verbatim. Only the legacy .slot-* labels use these
+   now — the generated seat tiles are placed by layoutTable() — but .slot-me
+   still marks my own tile, whose top is placed in pixels. */
 .slot-top   { left: 50%; transform: translateX(-50%); top: var(--y-top-tile); }
 .slot-me    { left: 50%; transform: translateX(-50%); top: var(--y-host-tile); z-index: 22; }
 .slot-left  { left: 15.0521%; top: var(--y-side-tile); }
@@ -1057,7 +1067,9 @@ input { font-family: inherit; }
   position: absolute;
   left: 50%;
   transform: translateX(-50%);
-  top: var(--y-centre);
+  /* Placed in pixels by layoutTable(), which derives this from the measured
+     heights of the bands around it. This stands in until the first measure. */
+  top: calc(var(--topbar-h) + var(--gap-unit));
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1223,13 +1235,12 @@ input { font-family: inherit; }
   border: 1px dashed rgba(255, 255, 255, 0.18);
 }
 
-/* ---- opponent card counts — one pill per opponent, in seat order.
-     Sits below the Start Game button so the two never collide. ----------- */
+/* Seat counts, one pill per opponent, in seat order. A flow child of the
+   centre cluster so its height counts towards the cluster's — see the note on
+   .btn-start-game. */
 .centre-seats {
-  position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
-  top: calc(var(--u) * 296);
+  position: relative;
+  margin-top: calc(var(--u) * 12);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1309,14 +1320,15 @@ input { font-family: inherit; }
 }
 
 /* ---- pre-game / next-round start button.
-     Sits in its own band directly beneath the piles (which end at y 241u),
-     with the seat pills and the hand header stacked below it. ----------- */
+     A flow child of the centre cluster, directly under the piles. It is
+     deliberately not an overlay: the cluster's measured height drives the
+     spacing of the bands around it, and an absolutely positioned child would
+     not be measured, so the button would hang below the reserve and the gap
+     under it would collapse. ------------------------------------------- */
 .btn-start-game {
-  position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
-  top: calc(var(--u) * 250);
+  position: relative;
   z-index: 30;
+  margin-top: calc(var(--u) * 14);
   background: var(--danger);
   color: #fff;
   font-family: var(--font-mono);
@@ -1329,8 +1341,8 @@ input { font-family: inherit; }
   box-shadow: 0 10px 26px rgba(210, 45, 57, 0.45);
   transition: transform 0.15s, filter 0.15s;
 }
-.btn-start-game:hover { transform: translateX(-50%) translateY(-2px); filter: brightness(1.1); }
-.btn-start-game:disabled { opacity: 0.45; cursor: not-allowed; transform: translateX(-50%); }
+.btn-start-game:hover { transform: translateY(-2px); filter: brightness(1.1); }
+.btn-start-game:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
 
 /* ---- my hand: 81x121.5 cards on a 90px pitch, first row at y 363u ------
      The panel is pinned to the CARD row; the header floats above it so a
@@ -1343,7 +1355,9 @@ input { font-family: inherit; }
   display: flex;
   flex-direction: column;
   align-items: center;
-  margin-top: calc(var(--u) * 122);
+  /* The header floats above the cards, so this leaves the cards just clear of
+     whatever the cluster holds above them. */
+  margin-top: calc(var(--u) * 44);
   min-width: 0;
 }
 
@@ -1991,12 +2005,11 @@ input { font-family: inherit; }
     --y-top-tile: 6%;
     --y-side-tile: 22%;
     --y-host-tile: 62%;
-    --y-centre: 33%;
   }
   .table-view { --pod-w: clamp(96px, 38vw, 152px); --pile-w: clamp(40px, 15vw, 62px); }
   .table-center { width: 96vw; }
   .table-turn-banner { height: auto; padding: 6px 12px; font-size: 12px; }
-  .my-hand-panel { width: 96vw; margin-top: 16px; }
+  .my-hand-panel { width: 96vw; margin-top: 18px; }
   .my-hand-cards-fan .uno-card { --cw: clamp(34px, 11vw, 52px); }
   .control-bar { left: 14px; transform: none; gap: 8px; bottom: 12px; }
   .call-control-pill { width: auto; padding: 0 6px; gap: 10px; }

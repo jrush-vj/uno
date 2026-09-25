@@ -210,7 +210,7 @@
 
     <!-- =====================================================================
          OPPONENT SEATS — generated at runtime.
-         The tiles are placed on an arc around the table by layoutSeats(), one
+         The tiles are placed on an arc around the table by layoutTable(), one
          tile per seated opponent, so 1..5 opponents always sit symmetrically
          instead of leaving hardcoded gaps. Empty seats are not rendered.
          ===================================================================== -->
@@ -261,7 +261,7 @@
     </div>
 
     <!-- Prebuilt opponent tile used as the template for each seat. Cloned and
-         positioned by layoutSeats(); never displayed itself. -->
+         positioned by layoutTable(); never displayed itself. -->
     <template id="seatTemplate">
       <div class="seat-slot">
         <div class="player-pod">
@@ -311,9 +311,13 @@
         </div>
       </div>
 
-      <div class="centre-seats" id="centreSeats"></div>
-
+      <!-- These two are flow children, not overlays: the centre cluster is
+           measured to place the bands around it, and an absolutely positioned
+           child would not count towards that measurement, so the rows would
+           silently spill past the bottom of the space reserved for them. -->
       <button class="btn-start-game" id="btnStartGame" style="display:none;">Start Game</button>
+
+      <div class="centre-seats" id="centreSeats"></div>
 
       <div class="my-hand-panel" id="myHandPanel">
         <div class="my-hand-header">
