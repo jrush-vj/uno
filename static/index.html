@@ -201,53 +201,83 @@
           </svg>
         </button>
       </div>
-      <div class="player-count-chip" id="playerCountChip">Players: 0/4</div>
+      <div class="player-count-chip" id="playerCountChip">Players: 0/6</div>
+      <div class="player-count-chip" id="roundChip" title="Round number">Round 0</div>
     </div>
   </header>
 
   <main class="table-view" id="tableView">
 
-    <!-- ======================= SEAT: TOP (across) ======================= -->
-    <div class="seat-slot slot-top">
-      <div class="player-pod empty" data-slot="top" id="pod-top">
-        <button class="btn-kick-player" type="button" title="Kick player" aria-label="Kick player" hidden>Kick</button>
-        <div class="camera-box">
-          <video autoplay playsinline webkit-playsinline muted></video>
-          <audio autoplay class="peer-audio" muted></audio>
-          <div class="mic-meter"><div class="mic-meter-fill"></div></div>
-          <span class="cam-name-text">Open Seat</span>
-        </div>
-        <div class="opp-card-tray"></div>
-      </div>
+    <!-- =====================================================================
+         OPPONENT SEATS — generated at runtime.
+         The tiles are placed on an arc around the table by layoutSeats(), one
+         tile per seated opponent, so 1..5 opponents always sit symmetrically
+         instead of leaving hardcoded gaps. Empty seats are not rendered.
+         ===================================================================== -->
+    <div id="seatLayer" class="seat-layer"></div>
+
+    <!-- Mid-game standings, bottom-left. Kept out of the way of the seats. -->
+    <div class="match-leaderboard" id="matchLeaderboard">
+      <div class="match-leaderboard-title">Standings</div>
+      <div id="matchLeaderboardRows"></div>
     </div>
 
-    <!-- ======================= SEAT: LEFT ======================= -->
-    <div class="seat-slot slot-left">
-      <div class="player-pod empty" data-slot="left" id="pod-left">
-        <button class="btn-kick-player" type="button" title="Kick player" aria-label="Kick player" hidden>Kick</button>
-        <div class="camera-box">
-          <video autoplay playsinline webkit-playsinline muted></video>
-          <audio autoplay class="peer-audio" muted></audio>
-          <div class="mic-meter"><div class="mic-meter-fill"></div></div>
-          <span class="cam-name-text">Open Seat</span>
-        </div>
-        <div class="opp-card-tray"></div>
+    <!-- Host-only rules panel, shown in the lobby before a round starts. -->
+    <div class="settings-panel hidden" id="settingsPanel">
+      <div class="settings-title">Game Settings</div>
+      <label class="settings-row">
+        <span>Starting cards</span>
+        <select id="setStartingCards">
+          <option value="7">7</option>
+          <option value="5">5</option>
+        </select>
+      </label>
+      <label class="settings-row">
+        <span>Points</span>
+        <select id="setPointsMode">
+          <option value="official">Official</option>
+          <option value="wins">Wins only</option>
+        </select>
+      </label>
+      <label class="settings-row">
+        <span>Turn timer</span>
+        <select id="setTurnTimer">
+          <option value="0">Off</option>
+          <option value="30">30 seconds</option>
+          <option value="60">60 seconds</option>
+        </select>
+      </label>
+      <div class="settings-actions">
+        <button type="button" id="btnShuffleSeats">Shuffle seats</button>
+        <button type="button" id="btnArrangeSeats">Arrange</button>
       </div>
+      <div class="settings-lock" id="settingsLock">Rules lock once the round starts.</div>
     </div>
 
-    <!-- ======================= SEAT: RIGHT ======================= -->
-    <div class="seat-slot slot-right">
-      <div class="player-pod empty" data-slot="right" id="pod-right">
-        <button class="btn-kick-player" type="button" title="Kick player" aria-label="Kick player" hidden>Kick</button>
-        <div class="camera-box">
-          <video autoplay playsinline webkit-playsinline muted></video>
-          <audio autoplay class="peer-audio" muted></audio>
-          <div class="mic-meter"><div class="mic-meter-fill"></div></div>
-          <span class="cam-name-text">Open Seat</span>
-        </div>
-        <div class="opp-card-tray"></div>
-      </div>
+    <!-- Shown to everyone the moment a round begins. -->
+    <div class="round-toast" id="roundToast">
+      <h3 id="roundToastTitle">Round 1</h3>
+      <ul id="roundToastList"></ul>
     </div>
+
+    <!-- Prebuilt opponent tile used as the template for each seat. Cloned and
+         positioned by layoutSeats(); never displayed itself. -->
+    <template id="seatTemplate">
+      <div class="seat-slot">
+        <div class="player-pod">
+          <button class="btn-kick-player" type="button" title="Kick player" aria-label="Kick player" hidden>Kick</button>
+          <span class="seat-order-badge" hidden></span>
+          <div class="camera-box">
+            <video autoplay playsinline webkit-playsinline muted></video>
+            <audio autoplay class="peer-audio" muted></audio>
+            <div class="mic-meter"><div class="mic-meter-fill"></div></div>
+            <span class="cam-name-text">Player</span>
+            <span class="seat-score-text">0</span>
+          </div>
+          <div class="opp-card-tray"></div>
+        </div>
+      </div>
+    </template>
 
     <!-- =================================================================
          CENTRE OF THE TABLE — the empty void in the Figma frame.
@@ -260,6 +290,7 @@
         <span class="turn-pulse-dot"></span>
         <span class="turn-banner-text" id="turnBannerText">Waiting for players...</span>
         <span class="turn-banner-sep"></span>
+        <span class="turn-timer-chip" id="turnTimerChip">0:00</span>
         <span class="direction-arrow-orb" id="directionArrow" title="Play direction">&#8635;</span>
         <span class="color-status-orb" id="colorOrb" style="background:#444;color:#444;"></span>
       </div>
@@ -404,9 +435,14 @@
     <span class="victory-trophy" id="gameOverTrophy">&#127942;</span>
     <h3 id="gameOverTitle">Game Over</h3>
     <p id="gameOverMsg">Round complete.</p>
+    <div class="lb-tabs">
+      <button class="lb-tab active" id="lbTabMatch" type="button">This match</button>
+      <button class="lb-tab" id="lbTabAllTime" type="button">All-time</button>
+    </div>
     <div class="leaderboard" id="leaderboardBox"></div>
+    <div class="leaderboard hidden" id="allTimeBox"></div>
     <div class="gameover-actions">
-      <button class="btn-primary" id="btnPlayAgain" style="display:none;">Play Next Round</button>
+      <button class="btn-primary" id="btnPlayAgain" style="display:none;">Continue Playing</button>
       <button class="btn-secondary" id="btnBackToLobby">Back to Lobby</button>
     </div>
   </div>

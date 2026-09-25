@@ -102,6 +102,164 @@ class RoomRegistry(Protocol):
     async def healthy(self) -> bool: ...
 
 
+# Scoring extras layered on top of the official card values settled in
+# server.py. These reward the two things the rules care about beyond raw cards.
+WIN_BONUS_POINTS = int(os.environ.get("WIN_BONUS_POINTS", "25"))
+UNO_CALL_POINTS = int(os.environ.get("UNO_CALL_POINTS", "5"))
+UNO_CAUGHT_PENALTY = int(os.environ.get("UNO_CAUGHT_PENALTY", "10"))
+
+
+@dataclass
+class PlayerStats:
+    """Lifetime record for one player name.
+
+    Keyed by display name rather than a login identity, because the app has
+    no accounts. Names are normalised to lowercase for the key so "Jerush"
+    and "jerush" accumulate together.
+    """
+
+    name: str
+    points: int = 0
+    wins: int = 0
+    rounds: int = 0
+    uno_calls: int = 0
+    best_round: int = 0
+    last_seen: float = field(default_factory=time.time)
+
+    @property
+    def win_rate(self) -> float:
+        return (self.wins / self.rounds) if self.rounds else 0.0
+
+    def to_json(self) -> dict:
+        return {
+            "name": self.name,
+            "points": self.points,
+            "wins": self.wins,
+            "rounds": self.rounds,
+            "uno_calls": self.uno_calls,
+            "best_round": self.best_round,
+            "last_seen": self.last_seen,
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "PlayerStats":
+        return cls(
+            name=payload["name"],
+            points=int(payload.get("points", 0)),
+            wins=int(payload.get("wins", 0)),
+            rounds=int(payload.get("rounds", 0)),
+            uno_calls=int(payload.get("uno_calls", 0)),
+            best_round=int(payload.get("best_round", 0)),
+            last_seen=float(payload.get("last_seen", time.time())),
+        )
+
+
+_player_stats: dict[str, PlayerStats] = {}
+
+
+def stats_key(name: str) -> str:
+    return (name or "player").strip().lower()[:24]
+
+
+class StatsStore(Protocol):
+    """Lifetime scores, kept separately from the room registry."""
+
+    async def record_round(self, players: list[dict]) -> None: ...
+    async def top_players(self, limit: int = 10) -> list[dict]: ...
+    async def get(self, name: str) -> Optional[PlayerStats]: ...
+
+
+class MemoryStats:
+    def __init__(self) -> None:
+        self._stats = _player_stats
+
+    async def record_round(self, players: list[dict]) -> None:
+        for entry in players:
+            name = stats_key(entry.get("name", ""))
+            if not name:
+                continue
+            stats = self._stats.setdefault(name, PlayerStats(name=entry["name"].strip()[:24]))
+            stats.points += int(entry.get("points", 0))
+            stats.rounds += 1
+            stats.uno_calls += int(entry.get("uno_calls", 0))
+            stats.best_round = max(stats.best_round, int(entry.get("round_points", 0)))
+            if entry.get("won"):
+                stats.wins += 1
+            stats.last_seen = time.time()
+
+    async def top_players(self, limit: int = 10) -> list[dict]:
+        rows = sorted(
+            self._stats.values(),
+            key=lambda s: (-s.points, -s.wins, s.name.lower()),
+        )[:max(1, limit)]
+        return [
+            {**row.to_json(), "win_rate": round(row.win_rate, 3)}
+            for row in rows
+        ]
+
+    async def get(self, name: str) -> Optional[PlayerStats]:
+        return self._stats.get(stats_key(name))
+
+
+class RedisStats:
+    """Redis-backed lifetime scores.
+
+    A sorted set holds the authoritative point totals so the leaderboard is a
+    single ZREVRANGE, while a hash per player keeps the remaining detail.
+    """
+
+    BOARD_KEY = "uno:stats:board"
+    PLAYER_PREFIX = "uno:stats:player:"
+
+    def __init__(self, url: str) -> None:
+        import redis.asyncio as redis
+
+        self._redis = redis.from_url(url, decode_responses=True)
+
+    async def record_round(self, players: list[dict]) -> None:
+        for entry in players:
+            name = stats_key(entry.get("name", ""))
+            if not name:
+                continue
+            key = self.PLAYER_PREFIX + name
+            existing = await self._redis.hgetall(key)
+            stats = PlayerStats.from_json(existing) if existing else PlayerStats(name=entry["name"].strip()[:24])
+            stats.points += int(entry.get("points", 0))
+            stats.rounds += 1
+            stats.uno_calls += int(entry.get("uno_calls", 0))
+            stats.best_round = max(stats.best_round, int(entry.get("round_points", 0)))
+            if entry.get("won"):
+                stats.wins += 1
+            stats.last_seen = time.time()
+            await self._redis.hset(key, mapping={k: str(v) for k, v in stats.to_json().items()})
+            await self._redis.zadd(self.BOARD_KEY, {name: stats.points})
+
+    async def top_players(self, limit: int = 10) -> list[dict]:
+        names = await self._redis.zrevrange(self.BOARD_KEY, 0, max(0, limit - 1))
+        rows = []
+        for name in names:
+            payload = await self._redis.hgetall(self.PLAYER_PREFIX + name)
+            if payload:
+                stats = PlayerStats.from_json(payload)
+                rows.append({**stats.to_json(), "win_rate": round(stats.win_rate, 3)})
+        return rows
+
+    async def get(self, name: str) -> Optional[PlayerStats]:
+        payload = await self._redis.hgetall(self.PLAYER_PREFIX + stats_key(name))
+        return PlayerStats.from_json(payload) if payload else None
+
+
+def build_stats() -> StatsStore:
+    """Mirror of build_registry: Redis when configured, memory otherwise."""
+    url = os.environ.get("REDIS_URL")
+    if not url:
+        return MemoryStats()
+    try:
+        return RedisStats(url)
+    except Exception:
+        return MemoryStats()
+
+
 def generate_code() -> str:
     return "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
 

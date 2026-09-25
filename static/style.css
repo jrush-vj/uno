@@ -240,6 +240,228 @@ input { font-family: inherit; }
 }
 .btn-ghost:hover { color: #fff; }
 
+/* ==========================================================================
+   SEATS — generated per opponent and placed on an arc
+   --------------------------------------------------------------------------
+   .seat-layer fills the table area and is the positioning context for every
+   opponent tile. Each tile is absolutely placed by layoutSeats() at a
+   percentage point on an ellipse, and --seat-scale shrinks the tile so a
+   larger table still leaves the centre visible.
+
+   Position uses a transform so the tile is centred on its arc point rather
+   than hung from its top-left corner, which is what keeps the ring even.
+   ========================================================================== */
+.seat-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.seat-layer .seat-slot {
+  position: absolute;
+  width: calc(var(--pod-w) * var(--seat-scale, 1));
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+  transition: left 0.32s ease, top 0.32s ease, width 0.32s ease;
+}
+
+.seat-layer .player-pod { position: relative; min-height: 0; }
+
+/* Score under the opponent's name, so the running total is visible mid-round. */
+.seat-score-text {
+  position: absolute;
+  right: 5.556%;
+  top: 79.97%;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: calc(var(--pod-w) * var(--seat-scale, 1) * 0.055);
+  color: var(--accent);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+  z-index: 3;
+}
+
+/* Seat order badge (1..n) shown while the host is arranging seats. */
+.seat-order-badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 8;
+  min-width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #111;
+  font: 700 12px/1 var(--font-mono);
+}
+.seat-order-badge[hidden] { display: none; }
+
+/* While arranging, tiles become drag targets. */
+.seat-layer.arranging .player-pod { cursor: grab; }
+.seat-layer.arranging .player-pod:active { cursor: grabbing; }
+
+/* ---- mid-game leaderboard, bottom-left of the table ---- */
+.match-leaderboard {
+  position: absolute;
+  left: max(12px, 2.2vw);
+  bottom: max(12px, 2.4vh);
+  z-index: 30;
+  min-width: 168px;
+  max-width: 230px;
+  padding: 9px 11px;
+  border-radius: 14px;
+  background: rgba(8, 8, 8, 0.82);
+  border: 1px solid #222;
+  backdrop-filter: blur(3px);
+  pointer-events: none;
+}
+.match-leaderboard-title {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.match-leaderboard .lb-mini {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding: 2px 0;
+}
+.match-leaderboard .lb-mini.is-me { color: #fff; font-weight: 700; }
+.match-leaderboard .lb-mini-rank { width: 15px; color: var(--text-muted); }
+.match-leaderboard .lb-mini-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.match-leaderboard .lb-mini-score { color: var(--accent); font-weight: 700; }
+
+@media (max-width: 900px) {
+  /* On a narrow table the leaderboard would cover a seat, so shrink it. */
+  .match-leaderboard { min-width: 0; max-width: 128px; padding: 6px 8px; }
+  .match-leaderboard .lb-mini { font-size: 10.5px; }
+}
+
+/* ==========================================================================
+   GAME SETTINGS PANEL (host) and the round-start summary (everyone)
+   ========================================================================== */
+.settings-panel {
+  position: absolute;
+  right: max(12px, 2.2vw);
+  top: max(70px, 7vh);
+  z-index: 40;
+  width: 236px;
+  padding: 12px 13px;
+  border-radius: 14px;
+  background: rgba(10, 10, 10, 0.94);
+  border: 1px solid #2a2a2a;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.6);
+}
+.settings-panel.hidden { display: none; }
+.settings-title {
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 9px;
+}
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.settings-row select {
+  background: #171717;
+  color: #fff;
+  border: 1px solid #333;
+  border-radius: 7px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.settings-actions { display: flex; gap: 6px; margin-top: 4px; }
+.settings-actions button {
+  flex: 1;
+  padding: 7px;
+  border-radius: 8px;
+  border: 1px solid #34343a;
+  background: #171717;
+  color: #fff;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.settings-actions button:hover { border-color: var(--accent); }
+.settings-lock {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* Round-start summary, shown to every player when a round begins. */
+.round-toast {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%) scale(0.96);
+  z-index: 60;
+  padding: 18px 26px;
+  border-radius: 18px;
+  background: rgba(8, 8, 8, 0.95);
+  border: 1px solid #2f2f2f;
+  text-align: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+}
+.round-toast.show { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+.round-toast h3 { font-size: 17px; margin-bottom: 8px; }
+.round-toast ul { list-style: none; font-size: 12.5px; color: var(--text-secondary); }
+.round-toast li { margin-bottom: 3px; }
+.round-toast b { color: var(--accent); }
+
+/* ---- turn clock ---- */
+.turn-timer-chip {
+  display: none;
+  margin-left: 8px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: rgba(252, 209, 22, 0.15);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 13px;
+}
+.turn-timer-chip.show { display: inline-block; }
+.turn-timer-chip.urgent {
+  background: rgba(210, 45, 57, 0.22);
+  color: #ff6b76;
+  animation: timerPulse 0.9s ease-in-out infinite;
+}
+@keyframes timerPulse { 50% { opacity: 0.55; } }
+
+/* ---- all-time leaderboard inside the game-over modal ---- */
+.lb-tabs { display: flex; gap: 5px; margin: 10px 0 6px; }
+.lb-tab {
+  flex: 1;
+  padding: 6px;
+  border: 1px solid #2f2f2f;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.lb-tab.active { color: var(--accent); border-color: var(--accent); }
+.lb-empty { font-size: 12px; color: var(--text-muted); padding: 8px 0; }
+
 /* ---- right-hand portfolio panel ---- */
 .home-info {
   background: var(--stage);

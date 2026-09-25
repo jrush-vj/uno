@@ -78,12 +78,18 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_SEATS = 4
+MAX_SEATS = 6
 UNO_CATCH_PENALTY = 2
 DRAW2_PENALTY = 2
 DRAW4_PENALTY = 4
 ACTION_CARD_POINTS = 20
 WILD_CARD_POINTS = 50
+
+# Allowed values for the host-controlled game settings. Anything outside
+# these lists is rejected rather than trusted from the client.
+VALID_STARTING_CARDS = (5, 7)
+VALID_POINTS_MODES = ("official", "wins")
+VALID_TURN_TIMERS = (0, 30, 60)   # seconds; 0 disables the timer
 
 RECONNECT_GRACE_SECONDS = 180        # how long a dropped seat is held open
 CLEANUP_INTERVAL_SECONDS = 30        # how often we sweep for expired seats
@@ -141,6 +147,40 @@ def build_deck() -> list[dict]:
 # --------------------------------------------------------------------------
 
 @dataclass
+class GameSettings:
+    """Host-controlled rules for a room.
+
+    Validated on the way in: the client is never trusted to send a sane
+    value, so each field is clamped to its allowed set.
+    """
+
+    starting_cards: int = 7
+    points_mode: str = "official"      # "official" (card values) or "wins"
+    turn_timer: int = 0                # seconds, 0 = off
+    seat_order: list = field(default_factory=list)   # tokens, host-arranged
+
+    def to_json(self) -> dict:
+        return {
+            "starting_cards": self.starting_cards,
+            "points_mode": self.points_mode,
+            "turn_timer": self.turn_timer,
+            "seat_order": list(self.seat_order),
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "GameSettings":
+        starting = int(payload.get("starting_cards", 7))
+        timer = int(payload.get("turn_timer", 0))
+        mode = str(payload.get("points_mode", "official"))
+        return cls(
+            starting_cards=starting if starting in VALID_STARTING_CARDS else 7,
+            points_mode=mode if mode in VALID_POINTS_MODES else "official",
+            turn_timer=timer if timer in VALID_TURN_TIMERS else 0,
+            seat_order=[str(t) for t in payload.get("seat_order", []) if t],
+        )
+
+
+@dataclass
 class Player:
     token: str
     peer_id: str
@@ -157,6 +197,8 @@ class Player:
     drew_this_turn: bool = False   # player drew a playable card this turn:
                                     # they MUST play that exact card now
     last_drawn_card_id: Optional[str] = None
+    round_points: int = 0          # points won in the most recent round
+    lifetime_wins: int = 0         # reported by the stats store on join
 
 
 @dataclass
@@ -171,6 +213,9 @@ class Room:
     started: bool = False
     host_token: Optional[str] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    settings: "GameSettings" = field(default_factory=GameSettings)
+    round_number: int = 0
+    turn_deadline: Optional[float] = None   # epoch seconds; None = no timer
 
     def seat_order(self) -> list[int]:
         return sorted(p.seat for p in self.players.values())
@@ -197,6 +242,9 @@ _rooms_guard = asyncio.Lock()
 # Code reservation, expiry and per-client creation caps live here so multiple
 # workers share one view once REDIS_URL is set.
 registry = store.build_registry()
+
+# Lifetime scores. Separate from the registry because it outlives any room.
+stats_store = store.build_stats()
 
 # How often the registry is swept for expired codes and abandoned rooms.
 ROOM_REAP_INTERVAL_SECONDS = 15
@@ -284,10 +332,14 @@ def advance_turn(room: Room, steps: int = 1) -> None:
         # The previous holder of the turn is gone (left / seat freed).
         # Fall back to the first seat in table order rather than crash.
         room.turn_seat = order[0]
+        arm_turn_timer(room)
         return
     idx = order.index(room.turn_seat)
     idx = (idx + steps * room.direction) % len(order)
     room.turn_seat = order[idx]
+    # Every turn change re-arms the clock, so the countdown always describes
+    # the player who currently owes a move.
+    arm_turn_timer(room)
 
 
 def card_playable(room: Room, card: dict) -> bool:
@@ -323,14 +375,43 @@ def card_points(card: dict) -> int:
 
 
 def settle_round(room: Room, winner: Player) -> int:
-    """Winner scores the total value of cards left in opponents' hands."""
-    pts = 0
-    for p in room.players.values():
-        if p is not winner:
-            for c in p.hand:
-                pts += card_points(c)
+    """Award the round and return the winner's points for it.
+
+    Under "official" scoring the winner takes the value of every card left in
+    opponents' hands. Under "wins" scoring the round is worth a flat amount so
+    a casual table is not decided by how badly someone was left holding cards.
+    """
+    if room.settings.points_mode == "wins":
+        pts = store.WIN_BONUS_POINTS
+    else:
+        pts = 0
+        for p in room.players.values():
+            if p is not winner:
+                for c in p.hand:
+                    pts += card_points(c)
     winner.score += pts
+    winner.round_points = pts
     return pts
+
+
+def record_round_stats(room: Room, winner: Player, round_points: int) -> None:
+    """Build the per-player round summary the stats store records.
+
+    A player is credited with one round played whether they won it or not, so
+    a win rate is meaningful. The UNO-call bonus is paid separately when the
+    call happens, not here.
+    """
+    entries = []
+    for p in room.players.values():
+        won = p is winner
+        entries.append({
+            "name": p.name,
+            "points": p.round_points if won else 0,
+            "round_points": p.round_points if won else 0,
+            "won": won,
+            "uno_calls": 1 if (p.called_uno and won) else 0,
+        })
+    return entries
 
 
 def leaderboard(room: Room, winner: Optional[Player] = None, round_points: int = 0) -> list[dict]:
@@ -339,12 +420,40 @@ def leaderboard(room: Room, winner: Optional[Player] = None, round_points: int =
             "seat": p.seat,
             "name": p.name,
             "score": p.score,
-            "round_points": round_points if p is winner else 0,
+            "round_points": p.round_points,
+            "lifetime_wins": p.lifetime_wins,
+            "is_host": p.token == room.host_token,
         }
         for p in room.players.values()
     ]
     rows.sort(key=lambda r: (-r["score"], r["seat"]))
     return rows
+
+
+def apply_seat_order(room: Room) -> None:
+    """Re-seat players according to the host's arrangement.
+
+    ``settings.seat_order`` holds tokens. Any player missing from it keeps a
+    seat after the arranged ones, so a stale order (someone left, someone
+    joined) degrades gracefully instead of failing.
+    """
+    ordered = [t for t in room.settings.seat_order if t in room.players]
+    for token in room.players:
+        if token not in ordered:
+            ordered.append(token)
+    for index, token in enumerate(ordered, start=1):
+        room.players[token].seat = index
+    room.settings.seat_order = ordered
+
+
+def shuffle_seats(room: Room) -> None:
+    """Randomise seating, then persist the new order in the settings."""
+    tokens = list(room.players.keys())
+    for i in range(len(tokens) - 1, 0, -1):
+        j = random.SystemRandom().randint(0, i)
+        tokens[i], tokens[j] = tokens[j], tokens[i]
+    room.settings.seat_order = tokens
+    apply_seat_order(room)
 
 
 # --------------------------------------------------------------------------
@@ -366,14 +475,18 @@ def clear_all_hands(room: Room) -> None:
 
 
 def start_game(room: Room) -> None:
+    """Deal a fresh round using the room's configured rules."""
+    apply_seat_order(room)
     room.deck = build_deck()
     room.discard = []
     room.direction = 1
+    room.round_number += 1
     for p in room.players.values():
-        p.hand = draw_from_deck(room, 7)
+        p.hand = draw_from_deck(room, room.settings.starting_cards)
         p.called_uno = False
         p.drew_this_turn = False
         p.last_drawn_card_id = None
+        p.round_points = 0
 
     first = draw_from_deck(room, 1)[0]
     while first["color"] == "black":
@@ -533,8 +646,22 @@ def handle_call_uno(player: Player) -> None:
     about to play their second-to-last card) all the way through holding
     just 1 — matching how most UNO apps let you call it early so you
     can't get caught by a faster opponent."""
-    if len(player.hand) in (1, 2):
+    if len(player.hand) in (1, 2) and not player.called_uno:
         player.called_uno = True
+        # The bonus is paid once per round, at the moment of the call.
+        player.score += store.UNO_CALL_POINTS
+
+
+def arm_turn_timer(room: Room) -> None:
+    """Start (or clear) the countdown for the player on turn.
+
+    Called wherever the turn changes, so the deadline always describes the
+    player who currently owes a move.
+    """
+    if room.settings.turn_timer and room.started:
+        room.turn_deadline = time.time() + room.settings.turn_timer
+    else:
+        room.turn_deadline = None
 
 
 def handle_catch_uno(room: Room, target_seat: int) -> bool:
@@ -621,14 +748,24 @@ def public_state(room: Room) -> dict:
                 "drew_this_turn": p.drew_this_turn,
                 "is_host": p.token == room.host_token,
                 "score": p.score,
+                "round_points": p.round_points,
+                "lifetime_wins": p.lifetime_wins,
             }
     top = room.discard[-1] if room.discard else None
     host_seat = None
     if room.host_token and room.host_token in room.players:
         host_seat = room.players[room.host_token].seat
+    # The countdown is sent as seconds remaining rather than an absolute
+    # deadline, because client clocks cannot be trusted to agree.
+    seconds_left = None
+    if room.turn_deadline is not None:
+        seconds_left = max(0, int(room.turn_deadline - time.time()))
     return {
         "room": room.room_id,
         "seats": seats,
+        # Seat numbers to peer tokens. The host's seat-arranging UI needs to
+        # send an order the server can apply, and the server orders by token.
+        "seat_tokens": {str(p.seat): p.token for p in room.players.values()},
         "turn_seat": room.turn_seat,
         "direction": room.direction,
         "current_color": room.current_color,
@@ -638,6 +775,9 @@ def public_state(room: Room) -> dict:
         "host_seat": host_seat,
         "player_count": len(room.players),
         "max_seats": MAX_SEATS,
+        "settings": room.settings.to_json(),
+        "round_number": room.round_number,
+        "turn_seconds_left": seconds_left,
     }
 
 
@@ -848,11 +988,50 @@ async def _turn_watchdog_loop() -> None:
                 await broadcast_notice(room, f"{acted_player.name} was away — drew and passed")
 
 
+async def _turn_timer_loop() -> None:
+    """Auto-draws for a player who lets the turn clock run out.
+
+    Mirrors the disconnected-player watchdog but is driven by the configured
+    ``turn_timer`` rather than by connectivity: an idle player still holds a
+    live socket, they just have not acted. Drawing on their behalf keeps the
+    table moving and matches the no-Pass rule the rest of the game follows.
+    """
+    while True:
+        await asyncio.sleep(1)
+        for room in list(rooms.values()):
+            if not room.started or room.turn_seat is None or not room.turn_deadline:
+                continue
+            if time.time() < room.turn_deadline:
+                continue
+            acted_player = None
+            async with room.lock:
+                current = room.player_by_seat(room.turn_seat)
+                if current is None:
+                    room.turn_deadline = None
+                    continue
+                try:
+                    if not current.drew_this_turn:
+                        handle_draw(room, current)
+                    # If a playable card was drawn the turn stays with them, so
+                    # the clock is re-armed rather than skipping them.
+                    arm_turn_timer(room)
+                    acted_player = current
+                except ValueError:
+                    room.turn_deadline = None
+            if acted_player:
+                await broadcast_state(room)
+                await send_hand(acted_player)
+                await broadcast_notice(
+                    room, f"{acted_player.name} ran out of time — drew a card"
+                )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     cleanup_task = asyncio.create_task(_cleanup_loop())
     watchdog_task = asyncio.create_task(_turn_watchdog_loop())
     reaper_task = asyncio.create_task(_room_reaper_loop())
+    timer_task = asyncio.create_task(_turn_timer_loop())
     log.info(
         "UNO server ready — %d seats per room, code TTL %ss, AFK %ss, serving %s",
         MAX_SEATS, store.CODE_TTL_SECONDS, store.AFK_ROOM_SECONDS, STATIC_DIR,
@@ -863,6 +1042,7 @@ async def lifespan(_: FastAPI):
         cleanup_task.cancel()
         watchdog_task.cancel()
         reaper_task.cancel()
+        timer_task.cancel()
 
 
 app = FastAPI(title="UNO Online", lifespan=lifespan)
@@ -980,10 +1160,56 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                             await send_json(websocket, {"type": "error", "message": "Need at least 2 players"})
                             continue
                         start_game(room)
+                        arm_turn_timer(room)
                     await broadcast_state(room)
                     for p in room.players.values():
                         await send_hand(p)
-                    await broadcast_notice(room, "New round started!")
+                    await broadcast_notice(
+                        room, f"Round {room.round_number} started!"
+                    )
+
+            # ---- host edits the rules ------------------------------------
+            elif mtype == "settings":
+                if player.token != room.host_token:
+                    await send_json(websocket, {"type": "error", "message": "Only the host can change settings."})
+                    continue
+                incoming = msg.get("settings") or {}
+                async with room.lock:
+                    if room.started:
+                        # Changing the deck size mid-round would desync every
+                        # hand, so rules are frozen once a round is live.
+                        await send_json(websocket, {
+                            "type": "error",
+                            "message": "Settings are locked during a round.",
+                        })
+                        continue
+                    room.settings = GameSettings.from_json(incoming)
+                    apply_seat_order(room)
+                await broadcast_state(room)
+                await broadcast_peers(room)
+                await broadcast_notice(room, "The host updated the game settings.")
+
+            # ---- host arranges the seating -------------------------------
+            elif mtype == "seat_order":
+                if player.token != room.host_token:
+                    await send_json(websocket, {"type": "error", "message": "Only the host can arrange seats."})
+                    continue
+                async with room.lock:
+                    requested = [str(t) for t in (msg.get("order") or []) if t]
+                    room.settings.seat_order = requested
+                    apply_seat_order(room)
+                await broadcast_state(room)
+                await broadcast_peers(room)
+
+            elif mtype == "shuffle_seats":
+                if player.token != room.host_token:
+                    await send_json(websocket, {"type": "error", "message": "Only the host can shuffle seats."})
+                    continue
+                async with room.lock:
+                    shuffle_seats(room)
+                await broadcast_state(room)
+                await broadcast_peers(room)
+                await broadcast_notice(room, "The host shuffled the seating.")
 
             # ---- draw ------------------------------------------------
             elif mtype == "draw":
@@ -991,6 +1217,7 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                     playable = False
                     async with room.lock:
                         drawn, playable = handle_draw(room, player)
+                        arm_turn_timer(room)
                     await broadcast_state(room)
                     await send_hand(player)
                 except ValueError as e:
@@ -1002,23 +1229,22 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                     async with room.lock:
                         winner, victim = handle_play(room, player, msg.get("card_id"), msg.get("chosen_color"))
                         round_points = 0
+                        stats_entries = []
                         if winner:
                             round_points = settle_round(room, player)
+                            stats_entries = record_round_stats(room, player, round_points)
                             # settle first (it scores the losers' hands), then
                             # the table is cleared — no cards outside a round
                             clear_all_hands(room)
+                        else:
+                            arm_turn_timer(room)
                     await broadcast_state(room)
                     if winner:
-                        # the round is over and every hand was just emptied,
-                        # so push the (now empty) hand to all clients
-                        for p in room.players.values():
-                            await send_hand(p)
-                    else:
-                        await send_hand(player)
-                        if victim:
-                            await send_hand(victim)
-                    if winner:
-                        board = leaderboard(room, winner=player, round_points=round_points)
+                        # Record lifetime scores before the round is reset, so
+                        # the leaderboard survives a restart.
+                        await stats_store.record_round(stats_entries)
+                        board = leaderboard(room)
+                        all_time = await stats_store.top_players(8)
                         for p in room.players.values():
                             await send_json(p.ws, {
                                 "type": "game_over",
@@ -1026,7 +1252,16 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                                 "winner_name": player.name,
                                 "round_points": round_points,
                                 "scores": board,
+                                "all_time": all_time,
+                                "round_number": room.round_number,
+                                "points_mode": room.settings.points_mode,
                             })
+                        for p in room.players.values():
+                            await send_hand(p)
+                    else:
+                        await send_hand(player)
+                        if victim:
+                            await send_hand(victim)
                 except ValueError as e:
                     await send_json(websocket, {"type": "error", "message": str(e)})
 
@@ -1437,6 +1672,13 @@ async def health() -> JSONResponse:
         "active_codes": await registry.active_count(),
         "redis": await registry.healthy(),
     })
+
+
+@app.get("/api/leaderboard")
+async def all_time_leaderboard(limit: int = 10) -> JSONResponse:
+    """Lifetime standings, independent of any live room."""
+    rows = await stats_store.top_players(max(1, min(limit, 50)))
+    return JSONResponse({"rows": rows}, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/rooms")

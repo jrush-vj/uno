@@ -25,6 +25,8 @@ let iceServers = [
   { urls: 'stun:stun.cloudflare.com:3478' }
 ];
 let keepAliveTimer = null;
+/* Seats are addressed by seat number now, so the legacy slot map only needs
+   to exist for the audio-meter helpers. Kept as a plain set of live seats. */
 const seatToSlotMap = {};
 const peerConnections = {};
 const remoteStreams = {};
@@ -168,13 +170,12 @@ const leaderboardBox = $('leaderboardBox');
 const btnPlayAgain = $('btnPlayAgain');
 const btnBackToLobby = $('btnBackToLobby');
 
-/* The local player always occupies the bottom tile. The remaining seats fill
-   the table clockwise from there: next seat sits to my left, then across from
-   me, then to my right. Positions never shuffle when the play direction flips
-   — only the turn order reverses, which is what the direction arrow shows. */
-const SLOT_NAMES = ['left', 'top', 'right'];
-const opponentPods = {};
-SLOT_NAMES.forEach(slot => { opponentPods[slot] = $(`pod-${slot}`); });
+/* Seats are addressed by seat number now. The generated tiles and their arc
+   positions are managed by layoutSeats() further down. */
+function opponentPod(seatNum) {
+  const node = seatNodes.get(Number(seatNum));
+  return node ? node.querySelector('.player-pod') : null;
+}
 
 function showToast(msg, duration = 3500) {
   const tc = document.getElementById('toast-container') || document.body;
@@ -359,8 +360,7 @@ function getLocalMeterEls() {
 }
 
 function getOpponentMeterEls(seatNum) {
-  const slotNum = seatToSlotMap[seatNum];
-  const pod = slotNum ? opponentPods[slotNum] : null;
+  const pod = opponentPod(seatNum);
   const meter = pod ? pod.querySelector('.mic-meter') : null;
   return meter ? { meter, fill: meter.querySelector('.mic-meter-fill') } : null;
 }
@@ -390,17 +390,313 @@ function audioMeterLoop() {
 }
 requestAnimationFrame(audioMeterLoop);
 
+/* ------------------------------------------------------------- seating ---
+   Opponent tiles are generated, not fixed. Each seated opponent gets a tile
+   placed on an arc around the table, measured from the bottom-centre (where
+   "my" tile sits) clockwise, so any count from 1 to 5 is symmetric:
+
+     1 opponent  -> directly opposite
+     2 opponents -> opposite-left and opposite-right
+     3 opponents -> adds the top-centre
+     4 opponents -> four evenly spaced
+     5 opponents -> five evenly spaced
+
+   Position is expressed as a percentage of the table area, and the tile size
+   shrinks a little as the count grows so the centre stays visible.
+
+   Only real players get a tile: there are no "Open Seat" placeholders, which
+   is what the previous fixed left/top/right slots drew.
+*/
+const SEAT_LAYER = $('seatLayer');
+const SEAT_TEMPLATE = $('seatTemplate');
+
+/* One entry per seated opponent, keyed by seat number. */
+const seatNodes = new Map();
+
+/* Opponents are spread across the upper semicircle, measured from the left
+   edge (180deg) to the right edge (0deg), so the group is always centred on
+   the vertical axis above "my" tile at the bottom. Verified positions:
+
+     1 opponent  -> [[50,12]]                          (directly opposite)
+     2 opponents -> [[28,17],[72,17]]                  (mirrored)
+     3 opponents -> [[19,23],[50,12],[81,23]]          (adds top-centre)
+     4 opponents -> [[14,28],[36,14],[64,14],[86,28]]
+     5 opponents -> [[12,31],[28,17],[50,12],[72,17],[88,31]]
+
+   The radius is wider horizontally than vertically because the stage is
+   wider than it is tall, which keeps the tiles visually equidistant rather
+   than merely mathematically so. */
+function seatArcPosition(index, total) {
+  const angle = (180 - (180 * (index + 1)) / (total + 1)) * (Math.PI / 180);
+  return {
+    left: 50 + 44 * Math.cos(angle),
+    top: 50 - 38 * Math.sin(angle),
+  };
+}
+
+function seatTileScale(total) {
+  if (total <= 2) return 1;
+  if (total === 3) return 0.92;
+  if (total === 4) return 0.82;
+  return 0.72;   // 5 opponents is the maximum
+}
+
+function buildSeatNode(seatNum) {
+  const node = SEAT_TEMPLATE.content.firstElementChild.cloneNode(true);
+  node.dataset.seat = String(seatNum);
+  SEAT_LAYER.appendChild(node);
+  seatNodes.set(seatNum, node);
+  return node;
+}
+
+function opponentPod(seatNum) {
+  const node = seatNodes.get(seatNum);
+  return node ? node.querySelector('.player-pod') : null;
+}
+
+/* Remove every tile that no longer belongs to a seated opponent. */
+function pruneSeatNodes(activeSeats) {
+  for (const [seatNum, node] of [...seatNodes.entries()]) {
+    if (!activeSeats.has(seatNum)) {
+      removeAudioMeter(seatNum);
+      const video = node.querySelector('video');
+      if (video) { try { video.pause(); video.srcObject = null; } catch (e) {} }
+      remoteVideoEls.delete(video);
+      const audio = node.querySelector('audio.peer-audio');
+      if (audio) { audio.srcObject = null; remoteAudioEls.delete(audio); }
+      node.remove();
+      seatNodes.delete(seatNum);
+    }
+  }
+}
+
+/* Position every tile, and size them for the current count. */
+function layoutSeats(seatNumbers) {
+  const scale = seatTileScale(seatNumbers.length);
+  seatNumbers.forEach((seatNum, index) => {
+    const node = seatNodes.get(seatNum);
+    if (!node) return;
+    const { left, top } = seatArcPosition(index, seatNumbers.length);
+    node.style.left = `${left}%`;
+    node.style.top = `${top}%`;
+    node.style.setProperty('--seat-scale', String(scale));
+    node.style.zIndex = String(10 + index);
+  });
+}
+
+/* ------------------------------------------------- host settings panel ---
+   Only the host may change rules, and only before a round starts. Everyone
+   else sees the same values applied but not the controls, which is why the
+   panel itself is host-only while the settings travel in public_state. */
+function currentSettingsFromPanel() {
+  return {
+    starting_cards: Number($('setStartingCards').value),
+    points_mode: $('setPointsMode').value,
+    turn_timer: Number($('setTurnTimer').value),
+  };
+}
+
+function pushSettings() {
+  sendServerMessage({ type: 'settings', settings: currentSettingsFromPanel() });
+}
+
+function syncSettingsPanel(state) {
+  const isHost = state.host_seat === mySeat;
+  const panel = $('settingsPanel');
+  if (!panel) return;
+  panel.classList.toggle('hidden', !isHost);
+  if (!isHost) return;
+
+  /* Reflect what the server actually holds, so a rejected change cannot leave
+     the controls showing a value the game is not using. */
+  const settings = state.settings || {};
+  $('setStartingCards').value = String(settings.starting_cards ?? 7);
+  $('setPointsMode').value = settings.points_mode || 'official';
+  $('setTurnTimer').value = String(settings.turn_timer ?? 0);
+  $('settingsLock').textContent = state.started
+    ? 'Rules are locked during a round.'
+    : 'Rules lock once the round starts.';
+}
+
+/* --------------------------------------------------- round-start summary ---
+   Shown to every player so the active rules are never a surprise. */
+let roundToastTimer = null;
+function showRoundToast(state) {
+  const toast = $('roundToast');
+  if (!toast) return;
+  const settings = state.settings || {};
+  const modeLabel = settings.points_mode === 'wins' ? 'Wins only' : 'Official card values';
+  const timerLabel = settings.turn_timer ? `${settings.turn_timer}s per turn` : 'No turn timer';
+  $('roundToastTitle').textContent = `Round ${state.round_number || 1}`;
+  $('roundToastList').innerHTML =
+    `<li>Starting cards: <b>${settings.starting_cards ?? 7}</b></li>` +
+    `<li>Points: <b>${modeLabel}</b></li>` +
+    `<li>Turn timer: <b>${timerLabel}</b></li>`;
+  toast.classList.add('show');
+  clearTimeout(roundToastTimer);
+  roundToastTimer = setTimeout(() => toast.classList.remove('show'), 2600);
+}
+
+/* -------------------------------------------------- mid-game leaderboard --- */
+function renderMatchLeaderboard(state) {
+  const box = $('matchLeaderboardRows');
+  if (!box) return;
+  const rows = Object.entries(state.seats || {})
+    .map(([seat, info]) => ({ seat: Number(seat), ...info }))
+    .sort((a, b) => (b.score || 0) - (a.score || 0) || a.seat - b.seat);
+  const medals = ['🥇', '🥈', '🥉'];
+  box.innerHTML = rows.map((row, index) => {
+    const rank = medals[index] || `${index + 1}`;
+    const mine = row.seat === mySeat ? ' is-me' : '';
+    const safeName = escapeHTML(row.name || 'Player');
+    return `<div class="lb-mini${mine}">`
+      + `<span class="lb-mini-rank">${rank}</span>`
+      + `<span class="lb-mini-name">${safeName}${row.seat === mySeat ? ' (you)' : ''}</span>`
+      + `<span class="lb-mini-score">${row.score || 0}</span>`
+      + '</div>';
+  }).join('');
+}
+
+/* ------------------------------------------------------ turn countdown ---
+   The server sends whole seconds remaining, re-synced on every state push.
+   Between pushes the client ticks locally so the display stays smooth. */
+let turnSecondsLeft = 0;
+let turnTimerTick = null;
+
+function syncTurnTimer(state) {
+  const chip = $('turnTimerChip');
+  if (!chip) return;
+  const total = state.settings?.turn_timer || 0;
+  const active = state.started && state.turn_seat != null && total > 0;
+  chip.classList.toggle('show', active);
+  if (!active) {
+    clearInterval(turnTimerTick);
+    turnTimerTick = null;
+    return;
+  }
+  turnSecondsLeft = state.turn_seconds_left ?? total;
+  paintTurnTimer();
+  if (!turnTimerTick) {
+    turnTimerTick = setInterval(() => {
+      if (turnSecondsLeft > 0) turnSecondsLeft -= 1;
+      paintTurnTimer();
+    }, 1000);
+  }
+}
+
+function paintTurnTimer() {
+  const chip = $('turnTimerChip');
+  if (!chip) return;
+  const seconds = Math.max(0, turnSecondsLeft);
+  chip.textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  chip.classList.toggle('urgent', seconds <= 5);
+}
+
+/* ------------------------------------------------------- seat arranging ---
+   "Arrange" turns the seats into draggable tiles. Dropping one tile onto
+   another swaps the two seats, which is the least surprising behaviour for a
+   fixed ring of positions. The new order is sent to the server, which
+   broadcasts it so every client re-renders the same arrangement. */
+let arrangingSeats = false;
+let dragSeatNum = null;
+
+function setArranging(on) {
+  arrangingSeats = on;
+  if (SEAT_LAYER) SEAT_LAYER.classList.toggle('arranging', on);
+  $('btnArrangeSeats').textContent = on ? 'Done' : 'Arrange';
+  document.querySelectorAll('.seat-order-badge').forEach(badge => {
+    badge.hidden = !on;
+  });
+  if (on) paintSeatOrderBadges();
+}
+
+function paintSeatOrderBadges() {
+  const seats = [...seatNodes.keys()].sort((a, b) => a - b);
+  seats.forEach((seatNum, index) => {
+    const badge = seatNodes.get(seatNum)?.querySelector('.seat-order-badge');
+    if (badge) badge.textContent = String(index + 1);
+  });
+}
+
+function currentSeatTokenOrder() {
+  /* The server orders by token; the client only knows seats. It maps each
+     seat back to the peer token it is displaying, taken from the last state. */
+  const seats = [...seatNodes.keys()].sort((a, b) => a - b);
+  const order = [];
+  seats.forEach(seatNum => {
+    const token = seatTokenBySeat[seatNum];
+    if (token) order.push(token);
+  });
+  return order;
+}
+
+/* seat -> peer token, refreshed from every state push so the host can send an
+   order the server can act on. */
+const seatTokenBySeat = {};
+
+function swapSeats(a, b) {
+  if (a == null || b == null || a === b) return;
+  const order = [...seatNodes.keys()].sort((n, n2) => n - n2);
+  const tokensBySeat = order.map(seatNum => seatTokenBySeat[seatNum]);
+  const ia = order.indexOf(a);
+  const ib = order.indexOf(b);
+  if (ia < 0 || ib < 0) return;
+  [tokensBySeat[ia], tokensBySeat[ib]] = [tokensBySeat[ib], tokensBySeat[ia]];
+  sendServerMessage({ type: 'seat_order', order: tokensBySeat.filter(Boolean) });
+}
+
+function wireSeatDragging() {
+  seatNodes.forEach((node, seatNum) => {
+    const pod = node.querySelector('.player-pod');
+    pod.draggable = false;
+
+    node.addEventListener('dragstart', event => {
+      if (!arrangingSeats) return;
+      dragSeatNum = seatNum;
+      event.dataTransfer.effectAllowed = 'move';
+    });
+    node.addEventListener('dragover', event => {
+      if (!arrangingSeats || dragSeatNum == null) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+    });
+    node.addEventListener('drop', event => {
+      if (!arrangingSeats || dragSeatNum == null) return;
+      event.preventDefault();
+      swapSeats(dragSeatNum, seatNum);
+      dragSeatNum = null;
+    });
+  });
+}
+
+function refreshSeatDraggability() {
+  seatNodes.forEach(node => {
+    const pod = node.querySelector('.player-pod');
+    if (pod) pod.draggable = arrangingSeats;
+  });
+}
+
 function updateSeatToSlotMapping(seats) {
-  Object.keys(seatToSlotMap).forEach(k => delete seatToSlotMap[k]);
   if (mySeat == null) return;
   const allSeats = Object.keys(seats).map(Number).sort((a, b) => a - b);
-  const startIdx = allSeats.indexOf(mySeat);
-  if (startIdx < 0) return;
+  const opponents = allSeats.filter(seatNum => seatNum !== mySeat);
 
-  for (let i = 1; i <= SLOT_NAMES.length && i < allSeats.length; i++) {
-    const seatNum = allSeats[(startIdx + i) % allSeats.length];
-    seatToSlotMap[seatNum] = SLOT_NAMES[i - 1];
-  }
+  const active = new Set(opponents);
+  pruneSeatNodes(active);
+  opponents.forEach(seatNum => {
+    if (!seatNodes.has(seatNum)) buildSeatNode(seatNum);
+  });
+  layoutSeats(opponents);
+  wireSeatDragging();
+  refreshSeatDraggability();
+
+  /* Kept for the audio-meter helpers, which look a seat up by slot name.
+     The value is now the seat's index around the arc rather than a fixed
+     left/top/right label. */
+  Object.keys(seatToSlotMap).forEach(k => delete seatToSlotMap[k]);
+  opponents.forEach((seatNum, index) => {
+    seatToSlotMap[seatNum] = index;
+  });
 }
 
 async function loadIceConfiguration() {
@@ -564,8 +860,12 @@ function handleServerMessage(msg) {
         lastHandIds = new Set();
         lastTopCardKey = '';
         startDeal(msg.state);
+        showRoundToast(msg.state);
       }
       renderGameState(msg.state);
+      renderMatchLeaderboard(msg.state);
+      syncSettingsPanel(msg.state);
+      syncTurnTimer(msg.state);
       break;
     }
 
@@ -642,20 +942,25 @@ function renderGameState(state) {
 
   updateSeatToSlotMapping(state.seats);
 
-  playerCountChip.textContent = `Players: ${state.player_count || 0}/${state.max_seats || 4}`;
+  /* Remember which token sits in which seat so the host can send a seating
+     order the server can act on (the server orders by token). */
+  Object.keys(seatTokenBySeat).forEach(k => delete seatTokenBySeat[k]);
+  if (state.seat_tokens) {
+    Object.entries(state.seat_tokens).forEach(([seat, token]) => {
+      seatTokenBySeat[Number(seat)] = token;
+    });
+  }
 
-  const assignedSlots = new Set(Object.values(seatToSlotMap));
-  SLOT_NAMES.forEach(slot => {
-    if (!assignedSlots.has(slot)) renderEmptyOpponentPod(slot);
-  });
+  playerCountChip.textContent = `Players: ${state.player_count || 0}/${state.max_seats || 6}`;
+  const roundChip = $('roundChip');
+  if (roundChip) roundChip.textContent = `Round ${state.round_number || 0}`;
 
   for (const [seatStr, playerInfo] of Object.entries(state.seats)) {
     const seatNum = Number(seatStr);
     if (seatNum === mySeat) {
       renderMyPod(playerInfo, state);
     } else {
-      const slot = seatToSlotMap[seatNum];
-      if (slot) renderActiveOpponentPod(slot, seatNum, playerInfo, state);
+      renderOpponentPod(seatNum, playerInfo, state);
     }
   }
 
@@ -729,12 +1034,9 @@ const centreSeatEls = {};
 let centreSeatKey = '';
 
 function centreSeatOrder() {
-  const seats = [];
-  SLOT_NAMES.forEach(slot => {
-    const seat = Object.keys(seatToSlotMap).find(k => seatToSlotMap[k] === slot);
-    if (seat) seats.push(Number(seat));
-  });
-  return seats;
+  /* Ordered exactly as the tiles sit around the arc, so a centre hand-count
+     pill is never attached to the wrong face on screen. */
+  return [...seatNodes.keys()].sort((a, b) => a - b);
 }
 
 function renderCentreSeats(state) {
@@ -809,40 +1111,14 @@ function renderOpponentFan(pod, count) {
   tray.appendChild(fan);
 }
 
-function renderEmptyOpponentPod(slot) {
-  const pod = opponentPods[slot];
-  if (!pod) return;
-  pod.className = 'player-pod empty';
-  pod.dataset.seat = '';
-  const kickButton = pod.querySelector('.btn-kick-player');
-  if (kickButton) kickButton.hidden = true;
-
-  const videoEl = pod.querySelector('video');
-  if (videoEl) {
-    videoEl.classList.remove('live');
-    videoEl.srcObject = null;
-    remoteVideoEls.delete(videoEl);
-  }
-  const audioEl = pod.querySelector('audio.peer-audio');
-  if (audioEl) {
-    audioEl.srcObject = null;
-    audioEl.muted = true;
-    remoteAudioEls.delete(audioEl);
-  }
-  updateAudioUnlockBanner();
-
-  const nameText = pod.querySelector('.cam-name-text');
-  if (nameText) nameText.textContent = 'Open Seat';
-  renderOpponentFan(pod, 0);
-}
-
-function renderActiveOpponentPod(slot, seatNum, info, state) {
-  const pod = opponentPods[slot];
+function renderOpponentPod(seatNum, info, state) {
+  const pod = opponentPod(seatNum);
   if (!pod) return;
 
   const isTurn = state.started && state.turn_seat === seatNum;
   pod.className = `player-pod${isTurn ? ' is-turn' : ''}`;
   pod.dataset.seat = String(seatNum);
+
   const myInfo = state.seats[String(mySeat)];
   const kickButton = pod.querySelector('.btn-kick-player');
   if (kickButton) {
@@ -857,6 +1133,9 @@ function renderActiveOpponentPod(slot, seatNum, info, state) {
 
   const nameText = pod.querySelector('.cam-name-text');
   if (nameText) nameText.textContent = info.name || 'Player';
+
+  const scoreText = pod.querySelector('.seat-score-text');
+  if (scoreText) scoreText.textContent = `${info.score || 0} pts`;
 
   const videoEl = pod.querySelector('video');
   const audioEl = pod.querySelector('audio.peer-audio');
@@ -1041,9 +1320,9 @@ function prefersReducedMotion() {
 
 /* `onLand(key)` fires as each card settles, key being the seat number or
    'me' — that is what grows the hands one card at a time. */
-function playDealAnimation(slots, onLand) {
+function playDealAnimation(seatNumbers, onLand) {
   if (!fxLayer || !btnDrawDeck || prefersReducedMotion()) return 0;
-  const podList = slots.map(s => opponentPods[s]).filter(Boolean);
+  const podList = seatNumbers.map(seatNum => opponentPod(seatNum)).filter(Boolean);
   podList.push(myPodSlot);
 
   const src = btnDrawDeck.getBoundingClientRect();
@@ -1104,7 +1383,7 @@ function playDealAnimation(slots, onLand) {
 
 function startDeal(state) {
   updateSeatToSlotMapping(state.seats);
-  const liveSlots = SLOT_NAMES.filter(slot => Object.values(seatToSlotMap).indexOf(slot) !== -1);
+  const liveSeats = [...seatNodes.keys()];
 
   dealInProgress = true;
   dealRevealed = Object.create(null);
@@ -1115,23 +1394,22 @@ function startDeal(state) {
   renderCentreSeats(state);
   myHandCardsContainer.innerHTML = '';
   myHandCountTag.textContent = '0 CARDS';
-  SLOT_NAMES.forEach(slot => {
-    const pod = opponentPods[slot];
+  liveSeats.forEach(seatNum => {
+    const pod = opponentPod(seatNum);
     const tray = pod && pod.querySelector('.opp-card-tray');
     if (tray) tray.innerHTML = '';
   });
 
-  const expected = (liveSlots.length + 1) * DEAL_CARDS_PER_PLAYER;
+  const expected = (liveSeats.length + 1) * (currentGameState?.settings?.starting_cards || 7);
   let dealt = 0;
 
-  const duration = playDealAnimation(liveSlots, key => {
+  const duration = playDealAnimation(liveSeats, key => {
     dealt++;
     dealRevealed[key] = (dealRevealed[key] || 0) + 1;
     if (key === 'me') {
       appendMyCard();
     } else {
-      const slot = seatToSlotMap[key];
-      const pod = slot && opponentPods[slot];
+      const pod = opponentPod(key);
       if (pod) appendOpponentBack(pod);
       const el = centreSeatEls[key];
       if (el) el.querySelector('.cs-count').textContent = String(dealRevealed[key]);
@@ -1291,6 +1569,8 @@ btnStartGame.onclick = () => sendServerMessage({ type: 'start' });
 
 btnPlayAgain.onclick = () => {
   modalGameOver.classList.remove('active');
+  /* "Continue Playing" keeps everyone seated and the scores running, which
+     is the whole point of a same-room rematch. */
   sendServerMessage({ type: 'start' });
 };
 
@@ -1366,10 +1646,14 @@ function cleanupSessionLocal() {
   centreSeats.innerHTML = '';
   Object.keys(centreSeatEls).forEach(k => delete centreSeatEls[k]);
 
-  SLOT_NAMES.forEach(slot => {
-    const pod = opponentPods[slot];
+  liveSeats.forEach(seatNum => {
+    const pod = opponentPod(seatNum);
     if (pod) renderOpponentFan(pod, 0);
   });
+  /* Tear down every generated seat tile too, or a stale tile from the last
+     game would linger when a new room is opened. */
+  setArranging(false);
+  pruneSeatNodes(new Set());
   closeDeviceMenu();
   clearChatLog();
 
@@ -1393,9 +1677,15 @@ function handleGameOver(msg) {
   if (won) sfx.victory();
   gameOverTrophy.textContent = won ? '🏆' : '👏';
   gameOverTitle.textContent = won ? 'You Won!' : `${msg.winner_name} Wins!`;
-  gameOverMsg.textContent = won
-    ? `You cleared your hand and earn +${msg.round_points || 0} points.`
-    : 'Points awarded from cards left in opponents\' hands.';
+  const roundLabel = msg.round_number ? `Round ${msg.round_number}` : 'Round';
+  gameOverMsg.textContent = msg.points_mode === 'wins'
+    ? `${roundLabel} complete — flat win bonus awarded.`
+    : `${roundLabel} complete — points taken from cards left in opponents' hands.`;
+
+  /* Lifetime standings travel with the game-over payload so the all-time tab
+     is populated without a second round trip. */
+  allTimeRows = Array.isArray(msg.all_time) ? msg.all_time : [];
+  showLeaderboardTab('match');
 
   leaderboardBox.innerHTML = '';
   const scores = Array.isArray(msg.scores) ? msg.scores : [];
@@ -1442,6 +1732,57 @@ function setupMyCameraFeed() {
     }
   }
 }
+
+/* --------------------------------------------------- settings controls --- */
+['setStartingCards', 'setPointsMode', 'setTurnTimer'].forEach(id => {
+  const el = $(id);
+  if (el) el.addEventListener('change', pushSettings);
+});
+
+if ($('btnShuffleSeats')) {
+  $('btnShuffleSeats').onclick = () => {
+    if (arrangingSeats) setArranging(false);
+    sendServerMessage({ type: 'shuffle_seats' });
+  };
+}
+
+if ($('btnArrangeSeats')) {
+  $('btnArrangeSeats').onclick = () => {
+    setArranging(!arrangingSeats);
+    refreshSeatDraggability();
+  };
+}
+
+/* --------------------------------------------------- leaderboard tabs --- */
+let allTimeRows = [];
+
+function renderAllTimeBox() {
+  const box = $('allTimeBox');
+  if (!box) return;
+  if (!allTimeRows.length) {
+    box.innerHTML = '<div class="lb-empty">No completed rounds yet.</div>';
+    return;
+  }
+  box.innerHTML = allTimeRows.map((row, index) => {
+    const medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `#${index + 1}`;
+    return '<div class="lb-row">'
+      + `<span class="lb-rank">${medal}</span>`
+      + `<span class="lb-name">${escapeHTML(row.name)}</span>`
+      + `<span class="lb-total">${row.points} pts</span>`
+      + '</div>';
+  }).join('');
+}
+
+function showLeaderboardTab(which) {
+  $('lbTabMatch').classList.toggle('active', which === 'match');
+  $('lbTabAllTime').classList.toggle('active', which === 'alltime');
+  $('leaderboardBox').classList.toggle('hidden', which !== 'match');
+  $('allTimeBox').classList.toggle('hidden', which !== 'alltime');
+  if (which === 'alltime') renderAllTimeBox();
+}
+
+if ($('lbTabMatch')) $('lbTabMatch').onclick = () => showLeaderboardTab('match');
+if ($('lbTabAllTime')) $('lbTabAllTime').onclick = () => showLeaderboardTab('alltime');
 
 btnToggleCam.onclick = () => camActive ? disableCamera() : enableCamera();
 btnToggleMic.onclick = () => micActive ? disableMic() : enableMic();
@@ -1716,9 +2057,7 @@ async function handleWebRTCSignal(fromToken, fromSeat, payload) {
 
 function attachRemoteStreamToSeat(seatNum, stream) {
   if (stream) remoteStreams[seatNum] = stream;
-  const slotNum = seatToSlotMap[seatNum];
-  if (!slotNum) return;
-  const pod = opponentPods[slotNum];
+  const pod = opponentPod(seatNum);
   if (!pod) return;
 
   const videoEl = pod.querySelector('video');
