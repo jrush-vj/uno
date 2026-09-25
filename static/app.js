@@ -3,6 +3,7 @@
 
 let ws = null;
 let myToken = null;
+let reconnectToken = null;
 let mySeat = null;
 let myRoom = 'main';
 let myCards = [];
@@ -476,6 +477,7 @@ function handleServerMessage(msg) {
   switch (msg.type) {
     case 'joined': {
       myToken = msg.peer_id;
+      reconnectToken = msg.token;
       mySeat = msg.seat;
       localStorage.setItem(`uno_token_${myRoom}`, msg.token);
       localStorage.setItem('uno_last_room', myRoom);
@@ -559,6 +561,12 @@ function handleServerMessage(msg) {
         localStorage.removeItem(`uno_token_${myRoom}`);
         resetJoinButton(msg.message);
       }
+      break;
+
+    case 'kicked':
+      if (reconnectToken) localStorage.removeItem(`uno_token_${myRoom}`);
+      cleanupSessionLocal();
+      resetJoinButton(msg.message || 'The host removed you from the table.');
       break;
 
     case 'game_over':
@@ -747,6 +755,8 @@ function renderEmptyOpponentPod(slot) {
   if (!pod) return;
   pod.className = 'player-pod empty';
   pod.dataset.seat = '';
+  const kickButton = pod.querySelector('.btn-kick-player');
+  if (kickButton) kickButton.hidden = true;
 
   const videoEl = pod.querySelector('video');
   if (videoEl) {
@@ -774,6 +784,17 @@ function renderActiveOpponentPod(slot, seatNum, info, state) {
   const isTurn = state.started && state.turn_seat === seatNum;
   pod.className = `player-pod${isTurn ? ' is-turn' : ''}`;
   pod.dataset.seat = String(seatNum);
+  const myInfo = state.seats[String(mySeat)];
+  const kickButton = pod.querySelector('.btn-kick-player');
+  if (kickButton) {
+    kickButton.hidden = !myInfo?.is_host;
+    kickButton.onclick = event => {
+      event.stopPropagation();
+      if (window.confirm(`Remove ${info.name || 'this player'} from the table?`)) {
+        sendServerMessage({ type: 'kick', target_seat: seatNum });
+      }
+    };
+  }
 
   const nameText = pod.querySelector('.cam-name-text');
   if (nameText) nameText.textContent = info.name || 'Player';
@@ -785,10 +806,9 @@ function renderActiveOpponentPod(slot, seatNum, info, state) {
   if (videoEl) {
     if (info.cam_on && stream) {
       const vTrack = stream.getVideoTracks()[0];
-      const videoOnlyStream = vTrack ? new MediaStream([vTrack]) : null;
-      if (videoOnlyStream) {
-        if (videoEl.srcObject !== videoOnlyStream) {
-          videoEl.srcObject = videoOnlyStream;
+      if (vTrack && vTrack.readyState === 'live') {
+        if (videoEl.srcObject !== stream) {
+          videoEl.srcObject = stream;
         }
         videoEl.muted = true;
         videoEl.classList.add('live');
@@ -1231,8 +1251,22 @@ function leaveTableAndReturnToLobby() {
   sendServerMessage({ type: 'leave' });
   localStorage.removeItem(`uno_token_${myRoom}`);
   localStorage.removeItem('uno_last_room');
+  reconnectToken = null;
   cleanupSessionLocal();
 }
+
+let exitBeaconSent = false;
+window.addEventListener('pagehide', () => {
+  if (exitBeaconSent || !reconnectToken || !myRoom) return;
+  exitBeaconSent = true;
+  fetch('/api/leave', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ room: myRoom, token: reconnectToken }),
+    keepalive: true,
+    credentials: 'same-origin'
+  }).catch(() => {});
+});
 
 function cleanupSessionLocal() {
   stopKeepAlivePing();
@@ -1254,6 +1288,7 @@ function cleanupSessionLocal() {
   camActive = false;
   micActive = false;
   myToken = null;
+  reconnectToken = null;
   mySeat = null;
   currentGameState = null;
   myCards = [];
@@ -1402,19 +1437,23 @@ function syncPeerConnections(peerList) {
 function createPeerConnection(peerToken, seatNum) {
   const isPolite = myToken > peerToken;
   const pc = new RTCPeerConnection({ iceServers });
+  const audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+  const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
   const entry = {
     pc, isPolite, seat: seatNum,
+    senders: {
+      audio: audioTransceiver.sender,
+      video: videoTransceiver.sender,
+    },
     makingOffer: false,
     ignoreOffer: false,
     pendingCandidates: [],
     hasRemoteDescription: false,
     lastConnectedAt: 0,
     restartTimer: null,
-    localTracksAdded: false,
   };
   peerConnections[peerToken] = entry;
-
-  addLocalTracksToPeerConnection(entry, pc);
+  refreshLocalTracksOnPeer(entry);
 
   pc.onnegotiationneeded = async () => {
     try {
@@ -1500,31 +1539,16 @@ function createPeerConnection(peerToken, seatNum) {
   return entry;
 }
 
-function addLocalTracksToPeerConnection(entry, pc) {
-  const stream = getLocalMediaStream() || placeholderStream;
-  if (!entry.localTracksAdded) {
-    ['audio', 'video'].forEach(kind => {
-      const track = localStream ? localStream.getTracks().find(t => t.kind === kind) : null;
-      try { pc.addTrack(track || null, stream); } catch(e) {}
-    });
-    entry.localTracksAdded = true;
-  }
-}
-
 function refreshLocalTracksOnPeer(entry) {
   if (!entry || !entry.pc) return;
   const pc = entry.pc;
   const realStream = getLocalMediaStream();
   ['audio', 'video'].forEach(kind => {
-    const sender = pc.getSenders().find(s => s.track && s.track.kind === kind);
+    const sender = entry.senders[kind];
     const newTrack = realStream ? realStream.getTracks().find(t => t.kind === kind) : null;
-    if (sender) {
-      if (sender.track !== newTrack) {
-        sender.replaceTrack(newTrack).catch(() => {});
-      }
-    } else if (newTrack) {
-      try { pc.addTrack(newTrack, realStream); } catch(e) {}
-    }
+    if (sender && sender.track !== newTrack) sender.replaceTrack(newTrack).catch(err => {
+      console.warn(`[WebRTC] ${kind} track replacement failed:`, err);
+    });
   });
 }
 
@@ -1639,10 +1663,9 @@ function attachRemoteStreamToSeat(seatNum, stream) {
   if (videoEl && s) {
     if (camOn) {
       const vTrack = s.getVideoTracks()[0];
-      const videoOnlyStream = vTrack ? new MediaStream([vTrack]) : null;
-      if (videoOnlyStream) {
-        if (videoEl.srcObject !== videoOnlyStream) {
-          videoEl.srcObject = videoOnlyStream;
+      if (vTrack && vTrack.readyState === 'live') {
+        if (videoEl.srcObject !== s) {
+          videoEl.srcObject = s;
         }
         videoEl.muted = true;
         videoEl.classList.add('live');
@@ -1712,7 +1735,7 @@ async function enableCamera() {
     camGroup.classList.add('active');
     camGroup.classList.remove('muted');
     localStorage.setItem('uno_pref_cam', '1');
-    refreshLocalTracksOnAllPeers();
+    await refreshLocalTracksOnAllPeers();
     setupMyCameraFeed();
     sendServerMessage({ type: 'media_state', cam_on: true, mic_on: micActive });
     return true;
@@ -1736,7 +1759,7 @@ function disableCamera() {
   camGroup.classList.add('muted');
   localStorage.setItem('uno_pref_cam', '0');
   Object.values(peerConnections).forEach(entry => {
-    const sender = entry.pc.getSenders().find(s => s.track && s.track.kind === 'video');
+    const sender = entry.senders.video;
     if (sender) sender.replaceTrack(null).catch(() => {});
   });
   setupMyCameraFeed();
@@ -1769,7 +1792,7 @@ async function enableMic() {
     micActive = true;
     micGroup.classList.add('active');
     localStorage.setItem('uno_pref_mic', '1');
-    refreshLocalTracksOnAllPeers();
+    await refreshLocalTracksOnAllPeers();
     attachAudioMeter('local', localStream, getLocalMeterEls);
     sendServerMessage({ type: 'media_state', cam_on: camActive, mic_on: true });
     return true;
@@ -1791,7 +1814,7 @@ function disableMic() {
   micGroup.classList.remove('active');
   localStorage.setItem('uno_pref_mic', '0');
   Object.values(peerConnections).forEach(entry => {
-    const sender = entry.pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+    const sender = entry.senders.audio;
     if (sender) sender.replaceTrack(null).catch(() => {});
   });
   removeAudioMeter('local');
@@ -1900,7 +1923,7 @@ async function switchDevice(kind, deviceId) {
       attachAudioMeter('local', localStream, getLocalMeterEls);
     }
 
-    refreshLocalTracksOnAllPeers();
+    await refreshLocalTracksOnAllPeers();
     sendServerMessage({ type: 'media_state', cam_on: camActive, mic_on: micActive });
   } catch (e) {
     showToast(`Could not switch ${isCam ? 'camera' : 'microphone'}`);

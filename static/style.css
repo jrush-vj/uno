@@ -353,6 +353,22 @@ input { font-family: inherit; }
 .player-pod { position: relative; min-height: 0; }
 .my-cam-pod { width: 100%; }
 
+.btn-kick-player {
+  position: absolute;
+  z-index: 7;
+  top: 8px;
+  right: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 999px;
+  padding: 5px 9px;
+  color: #fff;
+  background: rgba(190, 28, 42, 0.92);
+  font: 600 12px/1 var(--font-mono);
+  cursor: pointer;
+}
+.btn-kick-player:hover { background: #e11d48; }
+.btn-kick-player[hidden] { display: none; }
+
 .camera-box {
   position: relative;
   width: 100%;

@@ -1,10 +1,24 @@
 import base64
 import hashlib
 import hmac
+import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from server import Player, Room, broadcast_peers, build_ice_servers, public_state
+from unittest.mock import patch
+
+from server import (
+    Player,
+    Room,
+    app,
+    broadcast_peers,
+    build_ice_servers,
+    can_kick_player,
+    leave_on_page_exit,
+    public_state,
+    rooms,
+)
 
 
 class IceConfigTests(unittest.TestCase):
@@ -82,6 +96,54 @@ class PeerRosterTests(unittest.IsolatedAsyncioTestCase):
             sent = player.ws.send_text.await_args.args[0]
             self.assertIn(player.peer_id, sent)
             self.assertNotIn(player.token, sent)
+
+
+class PlayerLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        rooms.clear()
+        self.room = Room(room_id="lifecycle")
+        self.host = Player(
+            token="host-token", peer_id="host-peer", seat=1, name="Host", ws=AsyncMock()
+        )
+        self.guest = Player(
+            token="guest-token", peer_id="guest-peer", seat=2, name="Guest", ws=AsyncMock()
+        )
+        self.room.players = {self.host.token: self.host, self.guest.token: self.guest}
+        self.room.host_token = self.host.token
+        rooms[self.room.room_id] = self.room
+
+    def tearDown(self):
+        rooms.clear()
+
+    def test_only_host_can_kick_another_player(self):
+        self.assertTrue(can_kick_player(self.room, self.host, self.guest))
+        self.assertFalse(can_kick_player(self.room, self.guest, self.host))
+        self.assertFalse(can_kick_player(self.room, self.host, self.host))
+
+    def test_page_exit_endpoint_releases_seat_immediately(self):
+        class FakeRequest:
+            async def json(self):
+                return {"room": "lifecycle", "token": "guest-token"}
+
+        async def run_test():
+            with (
+                patch("server.broadcast_state", new=AsyncMock()),
+                patch("server.broadcast_peers", new=AsyncMock()),
+                patch("server.broadcast_notice", new=AsyncMock()),
+                patch("server.send_hand", new=AsyncMock()),
+            ):
+                return await leave_on_page_exit(FakeRequest())
+
+        from fastapi.responses import JSONResponse
+        import asyncio
+
+        response = asyncio.run(run_test())
+
+        self.assertIsInstance(response, JSONResponse)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(json.loads(response.body)["left"])
+        self.assertNotIn(self.guest.token, self.room.players)
+        self.assertEqual(len(self.room.players), 1)
 
 
 if __name__ == "__main__":

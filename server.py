@@ -57,7 +57,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -532,6 +532,26 @@ async def remove_player(room: Room, player: Player) -> Optional[Player]:
     return next_turn_player
 
 
+def can_kick_player(room: Room, requester: Player, target: Optional[Player]) -> bool:
+    return (
+        requester.token == room.host_token
+        and target is not None
+        and target.token != requester.token
+        and room.players.get(target.token) is target
+    )
+
+
+async def announce_player_removed(room: Room, player_name: str, next_turn_player: Optional[Player]) -> None:
+    await broadcast_state(room)
+    await broadcast_peers(room)
+    await broadcast_notice(room, player_name)
+    if next_turn_player:
+        await send_hand(next_turn_player)
+    elif len(room.players) < 2:
+        for remaining_player in room.players.values():
+            await send_hand(remaining_player)
+
+
 # --------------------------------------------------------------------------
 # Messaging
 # --------------------------------------------------------------------------
@@ -899,18 +919,36 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                 player.ws = None  # stop the finally-block below from double-handling this
                 left_name = player.name
                 next_turn_player = await remove_player(room, player)
-                await broadcast_state(room)
-                await broadcast_peers(room)
-                await broadcast_notice(room, f"{left_name} left the table")
-                if next_turn_player:
-                    await send_hand(next_turn_player)
-                elif len(room.players) < 2:
-                    # the round was abandoned — everybody's hand just emptied
-                    for p in room.players.values():
-                        await send_hand(p)
+                await announce_player_removed(room, f"{left_name} left the table", next_turn_player)
                 await send_json(websocket, {"type": "left_ok"})
                 await websocket.close()
                 return
+
+            elif mtype == "kick":
+                if player.token != room.host_token:
+                    await send_json(websocket, {"type": "error", "message": "Only the host can remove players."})
+                    continue
+                try:
+                    target_seat = int(msg.get("target_seat"))
+                except (TypeError, ValueError):
+                    await send_json(websocket, {"type": "error", "message": "Invalid player seat."})
+                    continue
+                target = room.player_by_seat(target_seat)
+                if not can_kick_player(room, player, target):
+                    await send_json(websocket, {"type": "error", "message": "That player cannot be removed."})
+                    continue
+                target_ws = target.ws
+                target_name = target.name
+                if target_ws is not None:
+                    await send_json(target_ws, {"type": "kicked", "message": "The host removed you from the table."})
+                target.ws = None
+                next_turn_player = await remove_player(room, target)
+                if target_ws is not None:
+                    try:
+                        await target_ws.close(code=4001, reason="Removed by host")
+                    except Exception:
+                        pass
+                await announce_player_removed(room, f"{target_name} was removed by the host", next_turn_player)
 
             # ---- WebRTC signaling relay ----------------------------------
             elif mtype == "webrtc":
@@ -965,6 +1003,31 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
             await broadcast_state(room)
             await broadcast_peers(room)
             await broadcast_notice(room, f"{player.name} disconnected")
+
+
+@app.post("/api/leave")
+async def leave_on_page_exit(request: Request) -> JSONResponse:
+    """Release a seat immediately when a browser tab closes or navigates away."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False}, status_code=400)
+    room_id = str(payload.get("room") or "")
+    token = str(payload.get("token") or "")
+    if not room_id or not token:
+        return JSONResponse({"ok": False}, status_code=400)
+
+    room_id = ROOM_ID_RE.sub("", room_id)[:32] or "main"
+    room = rooms.get(room_id)
+    player = room.players.get(token) if room else None
+    if player is None:
+        return JSONResponse({"ok": True, "left": False})
+
+    player.ws = None
+    name = player.name
+    next_turn_player = await remove_player(room, player)
+    await announce_player_removed(room, f"{name} left the table", next_turn_player)
+    return JSONResponse({"ok": True, "left": True})
 
 
 # --------------------------------------------------------------------------
