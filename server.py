@@ -64,6 +64,9 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import store
+from store import normalise_code
+
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
@@ -190,6 +193,13 @@ class Room:
 
 rooms: dict[str, Room] = {}
 _rooms_guard = asyncio.Lock()
+
+# Code reservation, expiry and per-client creation caps live here so multiple
+# workers share one view once REDIS_URL is set.
+registry = store.build_registry()
+
+# How often the registry is swept for expired codes and abandoned rooms.
+ROOM_REAP_INTERVAL_SECONDS = 15
 TURN_CREDENTIAL_REQUEST_LIMIT = 12
 TURN_CREDENTIAL_REQUEST_WINDOW = 60
 _turn_credential_requests: dict[str, list[float]] = {}
@@ -214,6 +224,18 @@ async def get_or_create_room(room_id: str) -> Room:
         if room_id not in rooms:
             rooms[room_id] = Room(room_id=room_id)
         return rooms[room_id]
+
+
+async def client_id_for(websocket: WebSocket) -> str:
+    """Stable identity for rate limiting.
+
+    Cloudflare is the only route in, so CF-Connecting-IP is the trustworthy
+    client address; a direct connection falls back to the socket peer.
+    """
+    forwarded = websocket.headers.get("cf-connecting-ip")
+    if forwarded:
+        return forwarded.strip()
+    return websocket.client.host if websocket.client else "unknown"
 
 
 # --------------------------------------------------------------------------
@@ -720,7 +742,73 @@ async def _cleanup_loop() -> None:
                     await broadcast_notice(room, f"{nm}'s seat was released (disconnected too long)")
         for rid in empty_rooms:
             rooms.pop(rid, None)
+            await registry.release(rid)
             log.info("Removed empty room: %s", rid)
+
+
+async def _room_reaper_loop() -> None:
+    """Expires reservation codes and closes AFK rooms.
+
+    Two separate rules, both aimed at the host's resources being wasted by
+    rooms nobody is playing in:
+
+    * a code nobody joined inside ``CODE_TTL_SECONDS`` is released, so
+      abandoned reservations cannot accumulate;
+    * a room with fewer than two players for ``AFK_ROOM_SECONDS`` is closed,
+      and its occupant is told why rather than silently disconnected.
+    """
+    while True:
+        await asyncio.sleep(ROOM_REAP_INTERVAL_SECONDS)
+        try:
+            for code in await registry.reap_expired():
+                room = rooms.pop(code, None)
+                log.info("Reaped expired code: %s", code)
+                if room:
+                    for p in list(room.players.values()):
+                        if p.connected:
+                            await send_json(p.ws, {
+                                "type": "kicked",
+                                "message": "That game expired because nobody joined in time.",
+                            })
+                            try:
+                                await p.ws.close(code=4002, reason="Room expired")
+                            except Exception:
+                                pass
+
+            # AFK: any room sitting with fewer than two players. This covers
+            # both a host waiting alone from the moment they created the
+            # game, and a table that emptied back down to one after a leave.
+            # Checked here rather than in Redis so the socket can be closed
+            # politely with an explanation.
+            now = time.time()
+            for rid, room in list(rooms.items()):
+                if len(room.players) > 1:
+                    continue
+                record = await registry.get(rid)
+                if not record:
+                    continue
+                idle_for = now - record.last_activity
+                # A reserved code nobody ever joined is left to the code TTL;
+                # a room with an actual player is subject to the AFK window.
+                if room.players and idle_for <= store.AFK_ROOM_SECONDS:
+                    continue
+                if not room.players and idle_for <= store.CODE_TTL_SECONDS:
+                    continue
+                for p in list(room.players.values()):
+                    if p.connected:
+                        await send_json(p.ws, {
+                            "type": "kicked",
+                            "message": "Game closed: nobody joined within two minutes.",
+                        })
+                        try:
+                            await p.ws.close(code=4002, reason="AFK")
+                        except Exception:
+                            pass
+                rooms.pop(rid, None)
+                await registry.release(rid)
+                log.info("Reaped AFK room: %s", rid)
+        except Exception:
+            log.exception("Room reaper failed")
 
 
 async def _turn_watchdog_loop() -> None:
@@ -764,12 +852,17 @@ async def _turn_watchdog_loop() -> None:
 async def lifespan(_: FastAPI):
     cleanup_task = asyncio.create_task(_cleanup_loop())
     watchdog_task = asyncio.create_task(_turn_watchdog_loop())
-    log.info("UNO server ready — %d seats per room, serving %s", MAX_SEATS, STATIC_DIR)
+    reaper_task = asyncio.create_task(_room_reaper_loop())
+    log.info(
+        "UNO server ready — %d seats per room, code TTL %ss, AFK %ss, serving %s",
+        MAX_SEATS, store.CODE_TTL_SECONDS, store.AFK_ROOM_SECONDS, STATIC_DIR,
+    )
     try:
         yield
     finally:
         cleanup_task.cancel()
         watchdog_task.cancel()
+        reaper_task.cancel()
 
 
 app = FastAPI(title="UNO Online", lifespan=lifespan)
@@ -782,10 +875,25 @@ app.add_middleware(GZipMiddleware, minimum_size=512)
 
 @app.websocket("/ws/{room_id}")
 async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
-    room_id = ROOM_ID_RE.sub("", room_id)[:32] or "main"
+    # A code is the only way in. Canonicalise before validating so a user who
+    # types lowercase, or pastes a spaced code, still reaches their room.
+    room_id = normalise_code(room_id)
     await websocket.accept()
-    room = await get_or_create_room(room_id)
     player: Optional[Player] = None
+
+    # Reconnects carry a saved token, so the room must still exist for them.
+    # Everything else needs a reserved code, which is what stops random
+    # names from spawning unlimited rooms on the host.
+    record = await registry.get(room_id)
+    if record is None:
+        await send_json(websocket, {
+            "type": "error",
+            "message": "That game code is not valid or has expired.",
+        })
+        await websocket.close()
+        return
+
+    room = await get_or_create_room(room_id)
 
     try:
         while True:
@@ -836,6 +944,12 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                         player.cam_on = bool(msg.get("cam_on"))
                     if "mic_on" in msg:
                         player.mic_on = bool(msg.get("mic_on"))
+                    # Two or more players means the host is no longer waiting
+                    # alone, so the code stops expiring on the reservation TTL.
+                    if len(room.players) >= 2:
+                        await registry.mark_live(room_id, len(room.players))
+                    else:
+                        await registry.touch(room_id, len(room.players))
                     log.info("'%s' joined room=%s seat=%s cam=%s mic=%s reconnect=%s",
                              player.name, room_id, player.seat, player.cam_on, player.mic_on, existing is not None)
                     await send_json(websocket, {
@@ -1320,6 +1434,35 @@ async def health() -> JSONResponse:
     return JSONResponse({
         "ok": True,
         "rooms": {rid: len(r.players) for rid, r in rooms.items()},
+        "active_codes": await registry.active_count(),
+        "redis": await registry.healthy(),
+    })
+
+
+@app.post("/api/rooms")
+async def create_room(request: Request) -> JSONResponse:
+    """Reserve a fresh room code for a new game.
+
+    The code is generated here rather than typed by the host so it is
+    unguessable, and it expires unless somebody joins in time.
+    """
+    client_id = request.headers.get("CF-Connecting-IP")
+    if not client_id:
+        client_id = request.client.host if request.client else "unknown"
+    if not await registry.allow_creation(client_id):
+        return JSONResponse(
+            {"error": "Too many games created. Please wait a few minutes."},
+            status_code=429,
+        )
+    code = await registry.reserve_code(host_token="")
+    if code is None:
+        return JSONResponse(
+            {"error": "The server is at capacity. Please try again shortly."},
+            status_code=503,
+        )
+    return JSONResponse({
+        "code": code,
+        "expires_in": store.CODE_TTL_SECONDS,
     })
 
 

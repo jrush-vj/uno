@@ -17,7 +17,12 @@ services:
       CLOUDFLARE_TURN_KEY_ID: ${CLOUDFLARE_TURN_KEY_ID:-}
       CLOUDFLARE_TURN_KEY: ${CLOUDFLARE_TURN_KEY:-}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      # Shared room registry. Leave unset to use the in-process fallback.
+      REDIS_URL: ${REDIS_URL:-}
+      CODE_TTL_SECONDS: ${CODE_TTL_SECONDS:-300}
+      AFK_ROOM_SECONDS: ${AFK_ROOM_SECONDS:-120}
       MAX_ROOMS: ${MAX_ROOMS:-200}
+      MAX_ROOMS_PER_CLIENT: ${MAX_ROOMS_PER_CLIENT:-3}
     ports:
       - "8899:8899"
     # Serve the app code straight off the host so edits go live without a
@@ -25,3 +30,5 @@ services:
     volumes:
       - ./static:/app/static:ro
       - ./server.py:/app/server.py:ro
+      - ./store.py:/app/store.py:ro
+      - ./store.py:/app/store.py:ro

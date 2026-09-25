@@ -17,6 +17,153 @@
 
 <div class="ambient-bg" id="ambientBg"></div>
 
+<!-- ============================ WELCOME / HOME ============================ -->
+<div id="home">
+  <div class="home-shell">
+
+    <!-- LEFT: the two actions a player actually needs -->
+    <section class="home-actions">
+      <div class="lobby-brand">
+        <span class="logo-uno">UNO</span>
+        <span class="logo-excl">!</span>
+      </div>
+      <p class="home-tagline">Play live UNO with real-time video and voice.</p>
+
+      <div class="form-group">
+        <label for="inputName">Your Name</label>
+        <input type="text" id="inputName" maxlength="20" placeholder="e.g. Jerush" autocomplete="off"/>
+      </div>
+
+      <div class="media-toggles">
+        <label class="media-toggle-card">
+          <input type="checkbox" id="checkCamera" checked/>
+          <span>Camera</span>
+        </label>
+        <label class="media-toggle-card">
+          <input type="checkbox" id="checkMic"/>
+          <span>Mic</span>
+        </label>
+      </div>
+
+      <button class="btn-action btn-create" id="btnCreateGame">
+        <span class="btn-action-icon">&#43;</span>
+        <span class="btn-action-copy">
+          <strong>Create New Game</strong>
+          <em>Get a code and invite friends</em>
+        </span>
+      </button>
+
+      <button class="btn-action btn-join" id="btnShowJoin">
+        <span class="btn-action-icon">&#8594;</span>
+        <span class="btn-action-copy">
+          <strong>Join With Code</strong>
+          <em>Already have an invite?</em>
+        </span>
+      </button>
+
+      <!-- shown after Create: the generated code + copy link -->
+      <div class="code-panel hidden" id="codePanel">
+        <div class="code-panel-label">Share this code</div>
+        <div class="code-value" id="codeValue">------</div>
+        <div class="code-meta">
+          <span id="codeCountdown">Expires in 5:00</span>
+          <button class="code-copy" id="btnCopyInvite" type="button">Copy invite link</button>
+        </div>
+        <button class="btn-primary" id="btnEnterTable" style="margin-top:12px;">
+          <span>Enter Table</span><span>&rarr;</span>
+        </button>
+        <div class="code-hint" id="codeHint">Copy the link, then enter the table while friends join.</div>
+      </div>
+
+      <!-- shown after Join: the code entry form -->
+      <div class="join-panel hidden" id="joinPanel">
+        <div class="form-group">
+          <label for="inputCode">Game Code</label>
+          <input type="text" id="inputCode" maxlength="6" placeholder="ABC123"
+                 autocomplete="off" autocapitalize="characters" spellcheck="false"/>
+        </div>
+        <button class="btn-primary" id="btnJoinWithCode">
+          <span>Enter Table</span><span>&rarr;</span>
+        </button>
+        <button class="btn-ghost" id="btnCancelJoin" type="button">Back</button>
+      </div>
+
+      <div class="lobby-err" id="lobbyErr"></div>
+    </section>
+
+    <!-- RIGHT: compact portfolio / how-it-works, no scrolling -->
+    <section class="home-info">
+      <div class="info-tabs" role="tablist">
+        <button class="info-tab active" data-tab="about" role="tab">About</button>
+        <button class="info-tab" data-tab="how" role="tab">How it works</button>
+        <button class="info-tab" data-tab="stack" role="tab">Stack</button>
+      </div>
+
+      <div class="info-body">
+        <div class="info-pane active" data-pane="about">
+          <h2>Self-hosted multiplayer UNO</h2>
+          <p class="info-lede">
+            A real-time card game with live video, built and hosted end-to-end
+            on a home server &mdash; no cloud platform behind it.
+          </p>
+          <ul class="info-points">
+            <li><b>4-player</b> rooms with authoritative server game logic</li>
+            <li><b>Live camera &amp; mic</b> via WebRTC mesh, TURN-relayed when NAT blocks a direct path</li>
+            <li><b>Reconnect-safe</b>: refresh or lose Wi-Fi without losing your seat</li>
+            <li><b>Self-hosted</b> on Proxmox, deployed with Coolify, published through a Cloudflare Tunnel</li>
+          </ul>
+          <div class="info-built">
+            <span class="info-built-label">Built by</span>
+            <strong>Jerush Vijay</strong>
+          </div>
+          <div class="info-links">
+            <a href="https://www.linkedin.com/in/jerush-vijay-8222a5317/" target="_blank" rel="noopener">LinkedIn</a>
+            <a href="https://github.com/jrush-vj" target="_blank" rel="noopener">GitHub</a>
+          </div>
+        </div>
+
+        <div class="info-pane" data-pane="how">
+          <h2>How a game flows</h2>
+          <ol class="info-steps">
+            <li><b>Create</b> &mdash; the server reserves a random 6-character code</li>
+            <li><b>Invite</b> &mdash; share the code or the invite link</li>
+            <li><b>Join</b> &mdash; others enter the code; the table fills to four seats</li>
+            <li><b>Play</b> &mdash; the host starts; the server validates every move</li>
+          </ol>
+          <table class="info-table">
+            <thead><tr><th>Where it runs</th><th>What it handles</th></tr></thead>
+            <tbody>
+              <tr><td>Your browser</td><td>UI, camera capture, WebRTC peers</td></tr>
+              <tr><td>Python server</td><td>Game rules, chat, room state</td></tr>
+              <tr><td>Cloudflare</td><td>HTTPS entry, TURN media relay</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="info-pane" data-pane="stack">
+          <h2>Under the hood</h2>
+          <table class="info-table">
+            <thead><tr><th>Layer</th><th>Choice</th></tr></thead>
+            <tbody>
+              <tr><td>Backend</td><td>Python &middot; FastAPI &middot; WebSockets</td></tr>
+              <tr><td>Frontend</td><td>Vanilla JS &middot; no build step</td></tr>
+              <tr><td>Media</td><td>WebRTC mesh + Cloudflare TURN</td></tr>
+              <tr><td>State</td><td>Redis-backed room registry</td></tr>
+              <tr><td>Hosting</td><td>Proxmox &middot; Coolify &middot; Cloudflare Tunnel</td></tr>
+            </tbody>
+          </table>
+          <ul class="info-points">
+            <li>Server-authoritative rules &mdash; clients cannot cheat a move</li>
+            <li>Codes expire in 5 minutes to shed unused rooms</li>
+            <li>Rooms with one idle player close after 2 minutes</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+  </div>
+</div>
+
 <!-- ============================ RECONNECT SCREEN ============================ -->
 <div id="reconnectScreen" class="hidden">
   <div class="lobby-modal">
@@ -26,45 +173,7 @@
     </div>
     <p class="lobby-tagline" id="reconnectText">Rejoining your table...</p>
     <div class="spinner"></div>
-    <button class="btn-primary" id="btnCancelReconnect" style="margin-top:20px;">Go to Lobby Instead</button>
-  </div>
-</div>
-
-<!-- ============================ LOBBY ============================ -->
-<div id="lobby">
-  <div class="lobby-modal">
-    <div class="lobby-brand">
-      <span class="logo-uno">UNO</span>
-      <span class="logo-excl">!</span>
-    </div>
-    <p class="lobby-tagline">Play live UNO with your friends with real-time video feeds.</p>
-
-    <div class="form-group">
-      <label for="inputName">Your Name</label>
-      <input type="text" id="inputName" maxlength="20" placeholder="e.g. Jerush" autocomplete="off"/>
-    </div>
-
-    <div class="form-group">
-      <label for="inputRoom">Room Code</label>
-      <input type="text" id="inputRoom" maxlength="24" value="main" autocomplete="off"/>
-    </div>
-
-    <div class="media-toggles">
-      <label class="media-toggle-card">
-        <input type="checkbox" id="checkCamera" checked/>
-        <span>Enable Camera</span>
-      </label>
-      <label class="media-toggle-card">
-        <input type="checkbox" id="checkMic"/>
-        <span>Enable Mic</span>
-      </label>
-    </div>
-
-    <button class="btn-primary" id="btnJoin" onclick="btnJoinClicked()">
-      <span>Enter Table</span>
-      <span>&rarr;</span>
-    </button>
-    <div class="lobby-err" id="lobbyErr"></div>
+    <button class="btn-primary" id="btnCancelReconnect" style="margin-top:20px;">Go to Home Instead</button>
   </div>
 </div>
 

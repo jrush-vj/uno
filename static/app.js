@@ -101,17 +101,26 @@ class SoundFX {
 const sfx = new SoundFX();
 
 const $ = id => document.getElementById(id);
-const lobby = $('lobby');
+const home = $('home');
 const reconnectScreen = $('reconnectScreen');
 const reconnectText = $('reconnectText');
 const btnCancelReconnect = $('btnCancelReconnect');
 const gameView = $('game-view');
 const inputName = $('inputName');
-const inputRoom = $('inputRoom');
+const inputCode = $('inputCode');
 const checkCamera = $('checkCamera');
 const checkMic = $('checkMic');
-const btnJoin = $('btnJoin');
 const lobbyErr = $('lobbyErr');
+const btnCreateGame = $('btnCreateGame');
+const btnShowJoin = $('btnShowJoin');
+const btnJoinWithCode = $('btnJoinWithCode');
+const btnCancelJoin = $('btnCancelJoin');
+const btnCopyInvite = $('btnCopyInvite');
+const btnEnterTable = $('btnEnterTable');
+const codePanel = $('codePanel');
+const joinPanel = $('joinPanel');
+const codeValue = $('codeValue');
+const codeCountdown = $('codeCountdown');
 const headerRoomLabel = $('headerRoomLabel');
 const btnCopyRoom = $('btnCopyRoom');
 const btnCopyRoomIcon = $('btnCopyRoomIcon');
@@ -455,10 +464,11 @@ function getWebSocketUrl(room) {
 
 function resetJoinButton(message) {
   hideReconnectOverlay();
-  lobby.classList.remove('hidden');
-  lobby.style.display = 'flex';
-  btnJoin.disabled = false;
-  btnJoin.innerHTML = '<span>Enter Table</span><span>&rarr;</span>';
+  if (home) { home.classList.remove('hidden'); home.style.display = 'flex'; }
+  clearCodeTimer();
+  pendingCode = null;
+  if (home) showHomePanel(null);
+  if (btnJoinWithCode) btnJoinWithCode.disabled = false;
   if (message) lobbyErr.textContent = message;
 }
 
@@ -529,8 +539,10 @@ function handleServerMessage(msg) {
       localStorage.setItem(`uno_token_${myRoom}`, msg.token);
       localStorage.setItem('uno_last_room', myRoom);
       hideReconnectOverlay();
-      lobby.classList.add('hidden');
-      lobby.style.display = 'none';
+      /* The host of a new game lands here; a joiner takes the same path, so
+         the home screen is dismissed once either of them is seated. */
+      if (home) { home.classList.add('hidden'); home.style.display = 'none'; }
+      clearCodeTimer();
       gameView.classList.add('active');
       gameView.style.display = 'flex';
       headerRoomLabel.textContent = myRoom.toUpperCase();
@@ -1367,9 +1379,13 @@ function cleanupSessionLocal() {
   modalColorChoice.classList.remove('active');
 
   hideReconnectOverlay();
-  lobby.classList.remove('hidden');
-  lobby.style.display = 'flex';
-  resetJoinButton('');
+  if (home) { home.classList.remove('hidden'); home.style.display = 'flex'; }
+  setupMyCameraFeedIfAvailable();
+}
+
+/* Leaving the table frees local media but must not touch the play again path. */
+function setupMyCameraFeedIfAvailable() {
+  try { setupMyCameraFeed(); } catch (e) {}
 }
 
 function handleGameOver(msg) {
@@ -2032,8 +2048,7 @@ function startWebRTCSanityCheck() {
 startWebRTCSanityCheck();
 
 function showReconnectOverlay(room, name) {
-  lobby.classList.add('hidden');
-  lobby.style.display = 'none';
+  if (home) { home.classList.add('hidden'); home.style.display = 'none'; }
   reconnectScreen.classList.remove('hidden');
   reconnectScreen.style.display = 'flex';
   reconnectText.innerHTML = `Rejoining <span class="reconnect-room-tag">${escapeHTML(room.toUpperCase())}</span> as ${escapeHTML(name)}...`;
@@ -2049,6 +2064,152 @@ btnCancelReconnect.onclick = () => {
   ws = null;
   resetJoinButton('');
 };
+
+/* ---------------------------------------------------------------- home ---
+   The home screen replaces the old single form. "Create" asks the server to
+   reserve a code; "Join" validates a code the player was given. Both funnel
+   into startSession(), which is the existing connect path. */
+let pendingCode = null;
+let codeTimer = null;
+
+function clearCodeTimer() {
+  if (codeTimer) { clearInterval(codeTimer); codeTimer = null; }
+}
+
+function showHomePanel(panel) {
+  codePanel.classList.toggle('hidden', panel !== 'code');
+  joinPanel.classList.toggle('hidden', panel !== 'join');
+  btnCreateGame.classList.toggle('hidden', panel === 'code');
+  btnShowJoin.classList.toggle('hidden', panel !== null);
+}
+
+function formatCountdown(seconds) {
+  const safe = Math.max(0, seconds);
+  return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2, '0')}`;
+}
+
+function startCodeCountdown(expiresIn) {
+  clearCodeTimer();
+  let remaining = expiresIn;
+  codeCountdown.textContent = `Expires in ${formatCountdown(remaining)}`;
+  codeTimer = setInterval(() => {
+    remaining -= 1;
+    codeCountdown.textContent = `Expires in ${formatCountdown(remaining)}`;
+    if (remaining <= 0) {
+      clearCodeTimer();
+      codeCountdown.textContent = 'Code expired';
+      codeValue.textContent = '------';
+      pendingCode = null;
+      lobbyErr.textContent = 'That code expired. Create a new game.';
+    }
+  }, 1000);
+}
+
+if (btnCreateGame) {
+  btnCreateGame.onclick = async () => {
+    const name = inputName.value.trim();
+    if (!name) { lobbyErr.textContent = 'Please enter your name first.'; return; }
+    lobbyErr.textContent = '';
+    btnCreateGame.disabled = true;
+    try {
+      const res = await fetch('/api/rooms', { method: 'POST' });
+      const payload = await res.json();
+      if (!res.ok) {
+        lobbyErr.textContent = payload.error || 'Could not create a game.';
+        return;
+      }
+      pendingCode = payload.code;
+      codeValue.textContent = payload.code;
+      showHomePanel('code');
+      startCodeCountdown(payload.expires_in || 300);
+      localStorage.setItem('uno_player_name', name);
+    } catch (err) {
+      lobbyErr.textContent = 'Network error while creating the game.';
+    } finally {
+      btnCreateGame.disabled = false;
+    }
+  };
+}
+
+if (btnShowJoin) {
+  btnShowJoin.onclick = () => {
+    if (!inputName.value.trim()) { lobbyErr.textContent = 'Please enter your name first.'; return; }
+    lobbyErr.textContent = '';
+    inputCode.value = '';
+    showHomePanel('join');
+    inputCode.focus();
+  };
+}
+
+if (btnCancelJoin) {
+  btnCancelJoin.onclick = () => {
+    lobbyErr.textContent = '';
+    showHomePanel(null);
+  };
+}
+
+if (btnEnterTable) {
+  // The host joins their own reserved room. Without this the code would be
+  // reserved but nobody would be sitting in the table when friends arrive,
+  // and the first guest would be made host instead.
+  btnEnterTable.onclick = () => {
+    if (!pendingCode) { lobbyErr.textContent = 'That code expired. Create a new game.'; return; }
+    const name = inputName.value.trim();
+    if (!name) { lobbyErr.textContent = 'Please enter your name first.'; return; }
+    lobbyErr.textContent = '';
+    clearCodeTimer();
+    startSession(pendingCode, name, checkCamera.checked, checkMic.checked);
+  };
+}
+
+if (btnCopyInvite) {
+  btnCopyInvite.onclick = () => {
+    if (!pendingCode) return;
+    const inviteUrl = `${location.origin}${location.pathname}?room=${encodeURIComponent(pendingCode)}`;
+    navigator.clipboard.writeText(inviteUrl)
+      .then(() => { btnCopyInvite.textContent = 'Copied!'; })
+      .catch(() => { btnCopyInvite.textContent = pendingCode; });
+    setTimeout(() => { btnCopyInvite.textContent = 'Copy invite link'; }, 2000);
+  };
+}
+
+if (btnJoinWithCode) {
+  btnJoinWithCode.onclick = () => {
+    const name = inputName.value.trim();
+    const code = (inputCode.value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!name) { lobbyErr.textContent = 'Please enter your name first.'; return; }
+    if (code.length !== 6) { lobbyErr.textContent = 'Enter the 6-character game code.'; return; }
+    lobbyErr.textContent = '';
+    btnJoinWithCode.disabled = true;
+    localStorage.setItem('uno_player_name', name);
+    startSession(code, name, checkCamera.checked, checkMic.checked);
+  };
+}
+
+/* Reading the invite link
+   -----------------------
+   "Create" hands you a link containing ?room=CODE. Opening it should drop
+   straight into the join panel with the code filled in, rather than making
+   the recipient retype it. */
+function readRoomFromUrl() {
+  try {
+    const raw = new URLSearchParams(location.search).get('room') || '';
+    return raw.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+  } catch (e) {
+    return '';
+  }
+}
+
+/* Portfolio tabs on the right-hand panel. */
+document.querySelectorAll('.info-tab').forEach(tab => {
+  tab.onclick = () => {
+    document.querySelectorAll('.info-tab').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.info-pane').forEach(el => el.classList.remove('active'));
+    tab.classList.add('active');
+    const pane = document.querySelector(`.info-pane[data-pane="${tab.dataset.tab}"]`);
+    if (pane) pane.classList.add('active');
+  };
+});
 
 async function startSession(room, name, camPref, micPref) {
   myRoom = room;
@@ -2069,23 +2230,24 @@ async function startSession(room, name, camPref, micPref) {
 
 window.btnJoinClicked = function() {
   const name = inputName.value.trim();
-  const room = (inputRoom.value.trim() || 'main').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'main';
+  const code = (inputCode.value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 
   if (!name) {
     lobbyErr.textContent = 'Please enter your name.';
     return;
   }
+  if (code.length !== 6) {
+    lobbyErr.textContent = 'Enter the 6-character game code.';
+    return;
+  }
   lobbyErr.textContent = '';
-  btnJoin.disabled = true;
-  btnJoin.innerHTML = '<span>Connecting...</span>';
   localStorage.setItem('uno_player_name', name);
 
-  startSession(room, name, checkCamera.checked, checkMic.checked);
+  startSession(code, name, checkCamera.checked, checkMic.checked);
 };
-if (btnJoin) btnJoin.onclick = window.btnJoinClicked;
 
-inputName.addEventListener('keydown', e => { if (e.key === 'Enter') btnJoin.click(); });
-inputRoom.addEventListener('keydown', e => { if (e.key === 'Enter') btnJoin.click(); });
+inputName.addEventListener('keydown', e => { if (e.key === 'Enter') btnCreateGame.click(); });
+inputCode.addEventListener('keydown', e => { if (e.key === 'Enter') btnJoinWithCode.click(); });
 checkCamera.addEventListener('change', () => localStorage.setItem('uno_pref_cam', checkCamera.checked ? '1' : '0'));
 checkMic.addEventListener('change', () => localStorage.setItem('uno_pref_mic', checkMic.checked ? '1' : '0'));
 
@@ -2093,28 +2255,29 @@ function boot() {
   const savedName = localStorage.getItem('uno_player_name');
   if (savedName) inputName.value = savedName;
 
-  let urlRoom = '';
-  try {
-    urlRoom = (new URLSearchParams(location.search).get('room') || '')
-      .replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24);
-  } catch(e) {}
+  const camPref = localStorage.getItem('uno_pref_cam');
+  const micPref = localStorage.getItem('uno_pref_mic');
+  checkCamera.checked = camPref === null ? true : camPref === '1';
+  checkMic.checked = micPref === '1';
 
-  const lastRoom = localStorage.getItem('uno_last_room');
-  const targetRoom = urlRoom || lastRoom;
-  const tokenForTarget = targetRoom ? localStorage.getItem(`uno_token_${targetRoom}`) : null;
+  const urlRoom = readRoomFromUrl();
 
-  if (targetRoom && tokenForTarget && savedName) {
-    inputRoom.value = targetRoom;
-    const camPref = localStorage.getItem('uno_pref_cam');
-    const micPref = localStorage.getItem('uno_pref_mic');
-    checkCamera.checked = camPref === null ? true : camPref === '1';
-    checkMic.checked = micPref === '1';
-    showReconnectOverlay(targetRoom, savedName);
-    startSession(targetRoom, savedName, checkCamera.checked, checkMic.checked);
+  /* An invite link carries a game code. If a stored session token exists for
+     that code, this is a refresh mid-game, so rejoin silently. Otherwise the
+     code is prefilled and the player just presses Enter Table. */
+  const tokenForCode = urlRoom ? localStorage.getItem(`uno_token_${urlRoom}`) : null;
+
+  if (urlRoom && tokenForCode && savedName) {
+    showReconnectOverlay(urlRoom, savedName);
+    startSession(urlRoom, savedName, checkCamera.checked, checkMic.checked);
     return;
   }
 
-  if (urlRoom) inputRoom.value = urlRoom;
+  if (urlRoom) {
+    inputCode.value = urlRoom;
+    showHomePanel('join');
+    lobbyErr.textContent = 'Invite link loaded — enter your name to join.';
+  }
 }
 
 boot();

@@ -1,3 +1,6 @@
 fastapi==0.115.0
 uvicorn==0.30.6
 websockets>=13.0
+# Optional: only needed when REDIS_URL is set, so several workers can share
+# the room registry. Without it the server uses its in-process fallback.
+redis>=5.0
