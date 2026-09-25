@@ -1128,6 +1128,10 @@ def generate_cloudflare_turn_credentials(
     The TURN key and TURN key ID stay on the server. Only the returned
     expiring ICE credentials are sent to the browser.
     """
+    # Pasted dashboard values often carry a trailing newline or space, which
+    # silently corrupts an Authorization header into a 401.
+    turn_key_id = (turn_key_id or "").strip()
+    turn_key = (turn_key or "").strip()
     ttl = max(60, min(int(ttl_seconds), 86400))
     endpoint = (
         "https://rtc.live.cloudflare.com/v1/turn/keys/"
@@ -1143,11 +1147,21 @@ def generate_cloudflare_turn_credentials(
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-        result = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # Cloudflare's error body explains *why* (bad key, no subscription,
+        # revoked key) and never echoes the secret back.
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            pass
+        raise ValueError(f"Cloudflare TURN API HTTP {exc.code}: {detail}") from exc
     ice_servers = result.get("iceServers")
     if not isinstance(ice_servers, list) or not ice_servers:
-        raise ValueError("Cloudflare TURN returned no ICE servers")
+        raise ValueError(f"Cloudflare TURN returned no ICE servers: {str(result)[:200]}")
     return _without_known_blocked_turn_urls(ice_servers)
 
 
@@ -1268,8 +1282,21 @@ async def ice_config(request: Request) -> JSONResponse:
             return JSONResponse(servers, headers={"Cache-Control": "no-store"})
         except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
             log.error("Cloudflare TURN credential request failed: %s", exc)
+            body = {"error": "TURN credentials temporarily unavailable"}
+            # TURN_DEBUG=1 surfaces Cloudflare's reason (never the secret) so a
+            # misconfigured key or missing subscription can be diagnosed.
+            if os.environ.get("TURN_DEBUG"):
+                body["detail"] = str(exc)[:300]
+                body["config"] = {
+                    "CLOUDFLARE_TURN_KEY_ID_length": len(cloudflare_key_id or ""),
+                    "CLOUDFLARE_TURN_KEY_length": len(cloudflare_turn_key or ""),
+                    "CLOUDFLARE_TURN_KEY_has_whitespace": (
+                        (cloudflare_turn_key or "") != (cloudflare_turn_key or "").strip()
+                    ),
+                    "TURN_TTL_SECONDS": os.environ.get("TURN_TTL_SECONDS", "unset"),
+                }
             return JSONResponse(
-                {"error": "TURN credentials temporarily unavailable"},
+                body,
                 status_code=503,
                 headers={"Cache-Control": "no-store"},
             )
