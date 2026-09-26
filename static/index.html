@@ -291,11 +291,21 @@
         <span class="turn-banner-text" id="turnBannerText">Waiting for players...</span>
         <span class="turn-banner-sep"></span>
         <span class="turn-timer-chip" id="turnTimerChip">0:00</span>
-        <span class="direction-arrow-orb" id="directionArrow" title="Play direction">&#8635;</span>
-        <span class="color-status-orb" id="colorOrb" style="background:#444;color:#444;"></span>
       </div>
 
+      <!-- The draw and discard piles sit together inside an outline whose
+           right side closes to a point. That outline is both the enclosure
+           and the direction arrow, stroked in the colour currently in play,
+           so one shape answers "which way" and "which colour". Reversing
+           mirrors it. viewBox is 20x14 units against a 3px stroke, so the
+           stroke scales with the design rather than being stretched. -->
       <div class="table-piles">
+        <svg class="piles-arrow" id="directionArrow" viewBox="0 0 20 14"
+             preserveAspectRatio="none" aria-hidden="true" focusable="false">
+          <path id="directionArrowPath"
+                d="M1.6 1.6 H15.2 L18.4 7 L15.2 12.4 H1.6 Z"/>
+        </svg>
+
         <div class="draw-deck-3d disabled" id="btnDrawDeck" title="Click to draw a card">
           <div class="deck-uno-badge"><span class="deck-uno-text">UNO</span></div>
           <div class="deck-count-tag" id="deckCountLabel">0</div>

@@ -139,8 +139,9 @@ const feltTable = $('feltTable');
 const turnBannerText = $('turnBannerText');
 const btnDrawDeck = $('btnDrawDeck');
 const deckCountLabel = $('deckCountLabel');
+/* The pile outline doubles as the direction arrow: reversing mirrors it, and
+   its stroke is the colour in play, so there is no separate colour element. */
 const directionArrow = $('directionArrow');
-const colorOrb = $('colorOrb');
 const discardTopCardContainer = $('discardTopCardContainer');
 const btnStartGame = $('btnStartGame');
 const myCamBox = $('myCamBox');
@@ -1143,18 +1144,21 @@ function renderGameState(state) {
   }
 
   const activeColor = CARD_COLORS[state.current_color] || '#3f3f46';
-  feltTable.style.setProperty('--active-color', state.current_color ? activeColor : 'transparent');
-
-  const arrowText = state.direction === 1 ? '\u21bb' : '\u21ba';
-  if (directionArrow.textContent !== arrowText) {
-    directionArrow.textContent = arrowText;
-    directionArrow.classList.remove('direction-pop');
-    void directionArrow.offsetWidth;
-    directionArrow.classList.add('direction-pop');
+  /* The arrow outline, the deck glow and the discard ring all take their
+     colour from --active-color and carry their own neutral fallback. Before
+     the first card is turned there is no colour in play, so the property is
+     removed rather than set to 'transparent': a variable that exists - even
+     as transparent - wins over the fallback in every var(), which left the
+     arrow invisible with no colour set. */
+  if (state.current_color) {
+    feltTable.style.setProperty('--active-color', activeColor);
+  } else {
+    feltTable.style.removeProperty('--active-color');
   }
 
-  colorOrb.style.background = activeColor;
-  colorOrb.style.color = activeColor;
+  /* Reversing is shown by mirroring the whole outline, so the arrowhead
+     swings to the other end and points the other way. */
+  directionArrow.classList.toggle('reverse', state.direction === -1);
   deckCountLabel.textContent = String(state.draw_pile_count || 0);
   const myState = state.seats[String(mySeat)];
   const myDrew = myState ? !!myState.drew_this_turn : false;

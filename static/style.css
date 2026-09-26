@@ -1119,44 +1119,60 @@ input { font-family: inherit; }
   flex-shrink: 0;
 }
 
-.direction-arrow-orb {
-  width: max(18px, calc(var(--u) * 26));
-  height: max(18px, calc(var(--u) * 26));
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: calc(var(--u) * 16);
-  font-weight: 800;
-  color: var(--accent);
-  flex-shrink: 0;
-}
-.direction-pop { animation: directionPop 0.4s cubic-bezier(0.34, 1.56, 0.64, 1); }
-@keyframes directionPop {
-  0%   { transform: scale(0.6) rotate(-70deg); }
-  60%  { transform: scale(1.12) rotate(6deg); }
-  100% { transform: scale(1) rotate(0deg); }
-}
+/* Direction and colour used to be two separate orbs here, at one end of the
+   banner and a long way from the cards they describe. They are now the stroke
+   of the arrow outline around the piles - see .piles-arrow. */
 
-.color-status-orb {
-  width: max(12px, calc(var(--u) * 17));
-  height: max(12px, calc(var(--u) * 17));
-  border-radius: 50%;
-  border: 2px solid rgba(255, 255, 255, 0.75);
-  box-shadow: 0 0 14px -2px currentColor;
-  flex-shrink: 0;
-}
-
-/* ---- piles: 118x177 cards, 47 apart, top of box at y 530 -------------- */
+/* ---- the pile frame: draw and discard enclosed by an arrow --------------
+   The border around the two piles *is* the direction indicator. It is drawn
+   as an outline whose right side closes to a point like an arrowhead, so the
+   enclosure itself shows which way play runs, and it is stroked in the colour
+   currently in play — reading the direction no longer needs a separate glyph,
+   and the colour cannot drift away from the arrow because they are the same
+   stroke. */
 .table-piles {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: calc(var(--u) * 47);
   margin-top: calc(var(--u) * 14);
+  /* Generous padding so the arrowhead has room to close without its point
+     landing on a card. The viewBox below is sized to this box exactly, so the
+     stroke scales with the design instead of being stretched. */
+  padding: calc(var(--u) * 30) calc(var(--u) * 34);
 }
+
+/* The outline itself. Drawn as a path rather than a border because a CSS
+   border cannot taper to a point, and a border-image cannot either. */
+.piles-arrow {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 0;
+  /* The colour in play is the stroke; the fallback covers the moment before
+     the first card is turned, when there is no colour yet. */
+  color: var(--active-color, rgba(255, 255, 255, 0.45));
+  transition: transform 0.4s cubic-bezier(0.34, 1.4, 0.64, 1), color 0.45s ease;
+  filter: drop-shadow(0 0 10px var(--active-color, transparent));
+}
+.piles-arrow path {
+  fill: rgba(255, 255, 255, 0.03);
+  stroke: currentColor;
+  stroke-width: 3;
+  /* The viewBox is stretched to the box, so the stroke is pinned to device
+     pixels instead of being stretched unevenly with it. */
+  vector-effect: non-scaling-stroke;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+/* Reversing mirrors the outline, so the arrowhead moves to the other side and
+   points the other way. A mirrored stroke keeps its colour. The transform is
+   transitioned so the swing reads as a turn rather than a jump. */
+.piles-arrow.reverse { transform: scaleX(-1); }
 
 .draw-deck-3d {
   width: var(--pile-w);
