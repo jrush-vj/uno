@@ -1787,6 +1787,21 @@ function cleanupSessionLocal() {
   modalColorChoice.classList.remove('active');
 
   hideReconnectOverlay();
+
+  /* Landing back in the lobby must always show the default home view. #home
+     is only hidden while the table is open, so on the way back it reappears
+     still showing whichever panel it was left on — for a host, that is the
+     "share this code" panel for a room that has just been left, counting down
+     to an expiry nothing is waiting for. Reset the panel, drop the reserved
+     code, and clear any message left over from the game that just ended.
+     Everything that returns to the lobby comes through here, so this covers
+     the exit button, "back to lobby" and being kicked alike. */
+  clearCodeTimer();
+  pendingCode = null;
+  codeValue.textContent = '------';
+  lobbyErr.textContent = '';
+  showHomePanel(null);
+
   if (home) { home.classList.remove('hidden'); home.style.display = 'flex'; }
   setupMyCameraFeedIfAvailable();
 }
