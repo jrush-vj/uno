@@ -1289,7 +1289,15 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                 next_turn_player = await remove_player(room, player)
                 await announce_player_removed(room, f"{left_name} left the table", next_turn_player)
                 await send_json(websocket, {"type": "left_ok"})
-                await websocket.close()
+                # The client closes its own socket as soon as it sends 'leave',
+                # so by the time this runs the close frame has usually already
+                # been sent and closing again raises. The player is out of the
+                # room by now, so this close is only a courtesy - and an
+                # unguarded one logs a traceback for every normal exit.
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
                 return
 
             elif mtype == "kick":
