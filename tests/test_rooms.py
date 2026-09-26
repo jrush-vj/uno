@@ -107,7 +107,7 @@ class AfkReaperTests(unittest.IsolatedAsyncioTestCase):
         registry._codes.clear()
         # a code reserved long ago that nobody joined
         registry._codes["OLD123"] = store.CodeRecord(
-            code="OLD123", host_token="h", created_at=0.0
+            code="OLD123", owner_key="h", created_at=0.0
         )
         ws = AsyncMock()
         player = server.Player(token="t", peer_id="p", seat=1, name="Host", ws=ws)
@@ -125,7 +125,7 @@ class AfkReaperTests(unittest.IsolatedAsyncioTestCase):
         registry._codes.clear()
         registry._codes["LIVE12"] = store.CodeRecord(
             code="LIVE12",
-            host_token="h",
+            owner_key="h",
             created_at=time.time(),
             live=True,
             last_activity=time.time() - (store.AFK_ROOM_SECONDS + 5),
@@ -149,6 +149,103 @@ class AfkReaperTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(reaped, [])
         self.assertIsNotNone(await registry.get(code))
+
+
+class HostAssignmentTests(unittest.IsolatedAsyncioTestCase):
+    """The creator of the code hosts, not whoever reaches the table first."""
+
+    async def asyncSetUp(self):
+        store._codes.clear()
+        self.registry = store.MemoryRegistry()
+        self.registry._codes.clear()
+
+    async def test_owner_of_returns_the_reserving_client(self):
+        code = await self.registry.reserve_code("client-abc")
+
+        self.assertEqual(await self.registry.owner_of(code), "client-abc")
+        self.assertEqual(await self.registry.owner_of(code.lower()), "client-abc")
+
+    async def test_owner_of_is_none_for_an_unknown_code(self):
+        self.assertIsNone(await self.registry.owner_of("NOPE12"))
+
+    def _room(self, host_key="creator-key"):
+        return server.Room(room_id="ABCDEF", host_key=host_key)
+
+    def test_creator_arriving_first_hosts_immediately(self):
+        room = self._room()
+
+        self.assertTrue(server.assign_room_host(room, "creator", "creator-key"))
+        self.assertEqual(room.host_token, "creator")
+        self.assertEqual(room.owner_token, "creator")
+
+    def test_guest_arriving_first_hosts_only_in_the_meantime(self):
+        """A friend opening the invite link must not keep the host controls.
+
+        The guest hosts while the creator is still on their way, then hands
+        over the moment the creator joins with the matching key.
+        """
+        room = self._room()
+
+        self.assertTrue(server.assign_room_host(room, "guest", None))
+        self.assertEqual(room.host_token, "guest")
+        self.assertIsNone(room.owner_token)
+
+        self.assertTrue(server.assign_room_host(room, "creator", "creator-key"))
+        self.assertEqual(room.host_token, "creator")
+        self.assertEqual(room.owner_token, "creator")
+
+    def test_a_guest_never_takes_the_host_with_the_wrong_key(self):
+        room = self._room()
+        server.assign_room_host(room, "first", None)
+
+        self.assertFalse(server.assign_room_host(room, "impostor", "some-other-key"))
+        self.assertEqual(room.host_token, "first")
+        self.assertIsNone(room.owner_token)
+
+    def test_creator_arriving_late_in_a_full_round_still_takes_over(self):
+        room = self._room()
+        server.assign_room_host(room, "first", None)
+        server.assign_room_host(room, "second", None)
+
+        self.assertTrue(server.assign_room_host(room, "creator", "creator-key"))
+        self.assertEqual(room.host_token, "creator")
+
+    def test_a_late_guest_cannot_reclaim_the_host_from_the_creator(self):
+        """Only the key-matching player holds the host, once it is claimed."""
+        room = self._room()
+        server.assign_room_host(room, "creator", "creator-key")
+
+        self.assertFalse(server.assign_room_host(room, "latecomer", None))
+        self.assertFalse(server.assign_room_host(room, "latecomer", "wrong-key"))
+        self.assertEqual(room.host_token, "creator")
+
+    def test_rooms_without_a_host_key_keep_first_come_first_served(self):
+        """A room whose code record is gone must still get a host."""
+        room = self._room(host_key=None)
+
+        self.assertTrue(server.assign_room_host(room, "first", None))
+        self.assertFalse(server.assign_room_host(room, "second", None))
+        self.assertEqual(room.host_token, "first")
+
+    async def test_host_key_is_resolved_once_and_survives_the_code_expiring(self):
+        """A running game must not lose track of its host.
+
+        A reserved code expires after CODE_TTL_SECONDS even while a game is
+        being played, after which the lookup would only ever return None. The
+        key is cached on the room, so it is read once and kept.
+        """
+        code = await self.registry.reserve_code("client-abc")
+        room = server.Room(room_id=code)
+        with patch.object(server, "registry", self.registry):
+            await server.resolve_room_host_key(room, code)
+            self.assertEqual(room.host_key, "client-abc")
+
+            # the reservation expires mid-game
+            await self.registry.release(code)
+            await server.resolve_room_host_key(room, code)
+
+        self.assertEqual(room.host_key, "client-abc", "the cached key must survive")
+        self.assertTrue(server.assign_room_host(room, "creator", "client-abc"))
 
 
 if __name__ == "__main__":

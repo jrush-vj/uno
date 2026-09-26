@@ -28,8 +28,8 @@ class RegistryBehaviourMixin:
     def setUp(self):
         store._ip_room_creations.clear()
 
-    async def _reserve(self, host="host-token"):
-        return await self.registry.reserve_code(host)
+    async def _reserve(self, owner="client-key"):
+        return await self.registry.reserve_code(owner)
 
     def test_generated_codes_use_the_unambiguous_alphabet(self):
         for _ in range(50):
@@ -79,9 +79,9 @@ class RegistryBehaviourMixin:
 
     def test_reap_removes_only_expired_unlive_codes(self):
         async def scenario():
-            stale = CodeRecord(code="STALE1", host_token="h", created_at=0.0)
-            live = CodeRecord(code="LIVE22", host_token="h", created_at=0.0, live=True)
-            fresh = CodeRecord(code="FRESH3", host_token="h", created_at=9_999_999_999.0)
+            stale = CodeRecord(code="STALE1", owner_key="h", created_at=0.0)
+            live = CodeRecord(code="LIVE22", owner_key="h", created_at=0.0, live=True)
+            fresh = CodeRecord(code="FRESH3", owner_key="h", created_at=9_999_999_999.0)
             self.registry._codes[stale.code] = stale
             self.registry._codes[live.code] = live
             self.registry._codes[fresh.code] = fresh

@@ -50,10 +50,16 @@ _codes: dict[str, "CodeRecord"] = {}
 
 @dataclass
 class CodeRecord:
-    """One reserved room code and the bookkeeping that expires it."""
+    """One reserved room code and the bookkeeping that expires it.
+
+    ``owner_key`` is opaque: it identifies the client that reserved the code
+    (see ``client_key``), NOT a player token, because the code exists before
+    any player has been given one. The game's actual host is still chosen at
+    join time - now by matching this key rather than by whoever arrives first.
+    """
 
     code: str
-    host_token: str
+    owner_key: str
     created_at: float
     player_count: int = 1
     live: bool = False          # a second player arrived, so no longer expiring
@@ -69,7 +75,7 @@ class CodeRecord:
     def to_json(self) -> dict:
         return {
             "code": self.code,
-            "host_token": self.host_token,
+            "owner_key": self.owner_key,
             "created_at": self.created_at,
             "player_count": self.player_count,
             "live": self.live,
@@ -80,7 +86,7 @@ class CodeRecord:
     def from_json(cls, payload: dict) -> "CodeRecord":
         return cls(
             code=payload["code"],
-            host_token=payload["host_token"],
+            owner_key=payload["owner_key"],
             created_at=float(payload["created_at"]),
             player_count=int(payload.get("player_count", 1)),
             live=bool(payload.get("live", False)),
@@ -91,8 +97,9 @@ class CodeRecord:
 class RoomRegistry(Protocol):
     """The storage contract both backends implement."""
 
-    async def reserve_code(self, host_token: str) -> Optional[str]: ...
+    async def reserve_code(self, owner_key: str) -> Optional[str]: ...
     async def get(self, code: str) -> Optional[CodeRecord]: ...
+    async def owner_of(self, code: str) -> Optional[str]: ...
     async def mark_live(self, code: str, players: int) -> None: ...
     async def touch(self, code: str, players: int) -> None: ...
     async def release(self, code: str) -> None: ...
@@ -279,18 +286,22 @@ class MemoryRegistry:
     def __init__(self) -> None:
         self._codes: dict[str, CodeRecord] = _codes
 
-    async def reserve_code(self, host_token: str) -> Optional[str]:
+    async def reserve_code(self, owner_key: str) -> Optional[str]:
         if await self.active_count() >= MAX_ACTIVE_ROOMS:
             return None
         for _ in range(50):
             code = generate_code()
             if code not in self._codes:
-                self._codes[code] = CodeRecord(code=code, host_token=host_token, created_at=time.time())
+                self._codes[code] = CodeRecord(code=code, owner_key=owner_key, created_at=time.time())
                 return code
         return None
 
     async def get(self, code: str) -> Optional[CodeRecord]:
         return self._codes.get(normalise_code(code))
+
+    async def owner_of(self, code: str) -> Optional[str]:
+        record = self._codes.get(normalise_code(code))
+        return record.owner_key if record else None
 
     async def mark_live(self, code: str, players: int) -> None:
         record = self._codes.get(normalise_code(code))
@@ -354,12 +365,12 @@ class RedisRegistry:
 
         self._redis = redis.from_url(url, decode_responses=True)
 
-    async def reserve_code(self, host_token: str) -> Optional[str]:
+    async def reserve_code(self, owner_key: str) -> Optional[str]:
         if await self.active_count() >= MAX_ACTIVE_ROOMS:
             return None
         for _ in range(50):
             code = generate_code()
-            record = CodeRecord(code=code, host_token=host_token, created_at=time.time())
+            record = CodeRecord(code=code, owner_key=owner_key, created_at=time.time())
             # NX so two workers can never claim the same code.
             claimed = await self._redis.set(
                 self.PREFIX + code,
@@ -374,6 +385,10 @@ class RedisRegistry:
     async def get(self, code: str) -> Optional[CodeRecord]:
         payload = await self._redis.get(self.PREFIX + normalise_code(code))
         return CodeRecord.from_json(_load(payload)) if payload else None
+
+    async def owner_of(self, code: str) -> Optional[str]:
+        record = await self.get(code)
+        return record.owner_key if record else None
 
     async def mark_live(self, code: str, players: int) -> None:
         record = await self.get(code)

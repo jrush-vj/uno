@@ -212,6 +212,13 @@ class Room:
     current_color: Optional[str] = None
     started: bool = False
     host_token: Optional[str] = None
+    # Who created the room's code, from registry.owner_of(). The creator is
+    # made host even if a friend reaches the table first, so opening the invite
+    # link no longer takes the host controls off the person who set the room
+    # up. host_key_resolved stops a re-query once the code record has expired.
+    host_key: Optional[str] = None
+    host_key_resolved: bool = False
+    owner_token: Optional[str] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     settings: "GameSettings" = field(default_factory=GameSettings)
     round_number: int = 0
@@ -688,6 +695,10 @@ async def remove_player(room: Room, player: Player) -> Optional[Player]:
         room.players.pop(player.token, None)
         if room.host_token == player.token:
             room.host_token = next(iter(room.players), None)
+        # The claim to host dies with the player who held it, so the room is
+        # never left with a host key that belongs to nobody in it.
+        if room.owner_token == player.token:
+            room.owner_token = None
         if room.started and len(room.players) < 2:
             room.started = False
             next_turn_player = None
@@ -707,6 +718,35 @@ def can_kick_player(room: Room, requester: Player, target: Optional[Player]) -> 
         and target.token != requester.token
         and room.players.get(target.token) is target
     )
+
+
+def assign_room_host(room: Room, token: str, claimed_key: Optional[str]) -> bool:
+    """Decide whether the player who just took a seat is the room's host.
+
+    The host is the person who created the room's code, not whoever connects
+    first, so a friend opening the invite link can no longer take the host
+    controls off the person who set the room up. That creator may still be on
+    their way, so the first arrival holds the host in the meantime and hands it
+    over when the matching key turns up. Returns whether this player is now
+    the host.
+    """
+    if room.owner_token is None and room.host_key and claimed_key == room.host_key:
+        room.owner_token = token
+    if room.host_token is None or room.owner_token == token:
+        room.host_token = token
+    return room.host_token == token
+
+
+async def resolve_room_host_key(room: Room, room_id: str) -> None:
+    """Look up who created this room's code, at most once.
+
+    Cached because a reserved code expires after CODE_TTL_SECONDS even while a
+    game is running, after which the lookup would only ever return None.
+    """
+    if room.host_key_resolved:
+        return
+    room.host_key_resolved = True
+    room.host_key = await registry.owner_of(room_id)
 
 
 async def announce_player_removed(room: Room, player_name: str, next_turn_player: Optional[Player]) -> None:
@@ -1118,8 +1158,13 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                         )
                         room.players[new_token] = player
                         is_new_player = True
-                        if room.host_token is None:
-                            room.host_token = new_token
+
+                        # The host is the person who created the code, so a
+                        # guest opening the invite link cannot take the host
+                        # controls. See assign_room_host for the handover rule.
+                        await resolve_room_host_key(room, room_id)
+                        if assign_room_host(room, new_token, msg.get("host_key")):
+                            log.info("'%s' is hosting room=%s", name, room_id)
                     if "cam_on" in msg:
                         player.cam_on = bool(msg.get("cam_on"))
                     if "mic_on" in msg:
@@ -1692,22 +1737,40 @@ async def all_time_leaderboard(limit: int = 10) -> JSONResponse:
     return JSONResponse({"rows": rows}, headers={"Cache-Control": "no-store"})
 
 
+def client_key(request: Request) -> str:
+    """Stable, opaque identity for the client behind a request.
+
+    Used for the per-client creation cap, and to remember who reserved a room
+    code so that person hosts the game they created. The key is handed to the
+    browser and echoed back on join, so it has to survive a proxy: the
+    connecting IP is read from the Cloudflare header when present and the
+    socket otherwise.
+    """
+    forwarded = request.headers.get("CF-Connecting-IP")
+    if not forwarded:
+        forwarded = request.client.host if request.client else "unknown"
+    # A rotating tunnel or a shared NAT can otherwise pool unrelated players
+    # under one key, so mix in what the browser tells us about itself.
+    agent = request.headers.get("user-agent") or ""
+    return hashlib.sha256(f"{forwarded}|{agent[:120]}".encode()).hexdigest()[:32]
+
+
 @app.post("/api/rooms")
 async def create_room(request: Request) -> JSONResponse:
     """Reserve a fresh room code for a new game.
 
     The code is generated here rather than typed by the host so it is
-    unguessable, and it expires unless somebody joins in time.
+    unguessable, and it expires unless somebody joins in time. The reserving
+    client's key travels back to the browser and is echoed on join, which is
+    how that person is made host instead of whoever happens to arrive first.
     """
-    client_id = request.headers.get("CF-Connecting-IP")
-    if not client_id:
-        client_id = request.client.host if request.client else "unknown"
-    if not await registry.allow_creation(client_id):
+    owner_key = client_key(request)
+    if not await registry.allow_creation(owner_key):
         return JSONResponse(
             {"error": "Too many games created. Please wait a few minutes."},
             status_code=429,
         )
-    code = await registry.reserve_code(host_token="")
+    code = await registry.reserve_code(owner_key=owner_key)
     if code is None:
         return JSONResponse(
             {"error": "The server is at capacity. Please try again shortly."},
@@ -1715,6 +1778,7 @@ async def create_room(request: Request) -> JSONResponse:
         )
     return JSONResponse({
         "code": code,
+        "host_key": owner_key,
         "expires_in": store.CODE_TTL_SECONDS,
     })
 

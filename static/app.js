@@ -894,6 +894,28 @@ function resetJoinButton(message) {
   if (message) lobbyErr.textContent = message;
 }
 
+/* The key the server handed this browser when it created the room's code.
+   Echoed on join so the creator is made host even when a friend opens the
+   invite link and reaches the table first. Kept in localStorage so a refresh
+   between creating the code and entering the table does not lose it. */
+function cachedHostKey(room) {
+  try { return localStorage.getItem(`uno_hostkey_${room}`); } catch (e) { return null; }
+}
+function rememberHostKey(room, key) {
+  try { if (key) localStorage.setItem(`uno_hostkey_${room}`, key); } catch (e) {}
+}
+function forgetHostKey(room) {
+  try { localStorage.removeItem(`uno_hostkey_${room}`); } catch (e) {}
+}
+
+/* Tell the server what my camera and mic are really doing. Sending this on
+   join as well as on every toggle closes the race that opens up when the
+   socket starts before getUserMedia: whichever finishes last, the server ends
+   up with the truth rather than with the state at the moment of joining. */
+function syncMyMediaState() {
+  sendServerMessage({ type: 'media_state', cam_on: camActive, mic_on: micActive });
+}
+
 function connectWebSocket() {
   const url = getWebSocketUrl(myRoom);
   try {
@@ -910,7 +932,10 @@ function connectWebSocket() {
       name: inputName.value.trim() || 'Player',
       token: savedToken,
       cam_on: camActive,
-      mic_on: micActive
+      mic_on: micActive,
+      /* Tells the server whether this browser is the one that created the
+         code, which is what decides the host. A guest sends null. */
+      host_key: cachedHostKey(myRoom)
     }));
   };
 
@@ -970,6 +995,10 @@ function handleServerMessage(msg) {
       headerRoomLabel.textContent = myRoom.toUpperCase();
       setupMyCameraFeed();
       startKeepAlivePing();
+      /* The camera and mic may have come up while this join was in flight; a
+         message sent before the seat existed was dropped, so restate the
+         real state now that there is a player to attach it to. */
+      syncMyMediaState();
       break;
     }
 
@@ -1801,6 +1830,10 @@ function cleanupSessionLocal() {
   codeValue.textContent = '------';
   lobbyErr.textContent = '';
   showHomePanel(null);
+  /* The room is behind us, so drop the claim to host it. Otherwise creating a
+     game later, reusing a code by chance, would try to host somebody else's
+     table. */
+  forgetHostKey(myRoom);
 
   if (home) { home.classList.remove('hidden'); home.style.display = 'flex'; }
   setupMyCameraFeedIfAvailable();
@@ -2598,6 +2631,9 @@ if (btnCreateGame) {
       }
       pendingCode = payload.code;
       codeValue.textContent = payload.code;
+      /* Remember that this browser created the code, so it hosts the room
+         even if somebody else reaches the table first. */
+      rememberHostKey(payload.code, payload.host_key);
       showHomePanel('code');
       startCodeCountdown(payload.expires_in || 300);
       localStorage.setItem('uno_player_name', name);
@@ -2694,6 +2730,18 @@ async function startSession(room, name, camPref, micPref) {
   try { sfx.init(); } catch(e) {}
   ensureAudioContext();
 
+  /* Join first, then bring the camera and microphone up.
+
+     Entering the table used to wait on getUserMedia - a device query that
+     regularly takes a second or more, and longer the first time permissions
+     are granted - before it would even open the socket. The seat and the deal
+     need milliseconds, so the table sat still and looked frozen. The socket
+     now goes up straight away and the media stream follows: every peer
+     connection is built from the server's peer list and refreshes its local
+     tracks, so attaching the stream late is already the supported path (it is
+     what happens when a camera is switched on mid-game). */
+  connectWebSocket();
+
   await loadIceConfiguration().catch(() => {});
 
   if (camPref) {
@@ -2702,8 +2750,6 @@ async function startSession(room, name, camPref, micPref) {
   if (micPref) {
     try { await enableMic(); } catch(e) { console.warn('Mic init:', e); }
   }
-
-  connectWebSocket();
 }
 
 window.btnJoinClicked = function() {
