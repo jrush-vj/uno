@@ -1119,60 +1119,106 @@ input { font-family: inherit; }
   flex-shrink: 0;
 }
 
-/* Direction and colour used to be two separate orbs here, at one end of the
-   banner and a long way from the cards they describe. They are now the stroke
-   of the arrow outline around the piles - see .piles-arrow. */
+.direction-arrow-orb {
+  width: max(18px, calc(var(--u) * 26));
+  height: max(18px, calc(var(--u) * 26));
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: calc(var(--u) * 16);
+  font-weight: 800;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.direction-pop { animation: directionPop 0.4s cubic-bezier(0.34, 1.56, 0.64, 1); }
+@keyframes directionPop {
+  0%   { transform: scale(0.6) rotate(-70deg); }
+  60%  { transform: scale(1.12) rotate(6deg); }
+  100% { transform: scale(1) rotate(0deg); }
+}
 
-/* ---- the pile frame: draw and discard enclosed by an arrow --------------
-   The border around the two piles *is* the direction indicator. It is drawn
-   as an outline whose right side closes to a point like an arrowhead, so the
-   enclosure itself shows which way play runs, and it is stroked in the colour
-   currently in play — reading the direction no longer needs a separate glyph,
-   and the colour cannot drift away from the arrow because they are the same
-   stroke. */
+.color-status-orb {
+  width: max(12px, calc(var(--u) * 17));
+  height: max(12px, calc(var(--u) * 17));
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.75);
+  box-shadow: 0 0 14px -2px currentColor;
+  flex-shrink: 0;
+}
+
+/* ---- piles: 118x177 cards, 47 apart, top of box at y 530 -------------- */
 .table-piles {
+  /* The direction ring is positioned against this box, so it must be the
+     containing block and not the (much larger) centre cluster. */
   position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: calc(var(--u) * 47);
-  margin-top: calc(var(--u) * 14);
-  /* Generous padding so the arrowhead has room to close without its point
-     landing on a card. The viewBox below is sized to this box exactly, so the
-     stroke scales with the design instead of being stretched. */
-  padding: calc(var(--u) * 30) calc(var(--u) * 34);
+  /* The ring's arc curves above and below the cards, and this margin is what
+     it curves into. It was 14u, which left the arc only 2px from the turn
+     banner at smaller windows - the cards have a minimum width and stop
+     shrinking before the banner does, so that gap closes as the viewport
+     narrows and the ring would start to crowd it. */
+  margin-top: calc(var(--u) * 26);
 }
 
-/* The outline itself. Drawn as a path rather than a border because a CSS
-   border cannot taper to a point, and a border-image cannot either. */
-.piles-arrow {
+/* ---- play-direction ring, wrapped around both piles.
+     Each dimension is a share of the pile group rather than of the viewport,
+     so the ring stays concentric with the cards at every resolution. The
+     width is deliberately larger than the height: the piles are wider than
+     they are tall, and the centre column is packed tightly between the turn
+     banner above and the hand below, so a circle wide enough to clear the
+     cards would run through both of them. ------------------------------- */
+.pile-loop {
   position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
+  left: 50%;
+  top: 50%;
+  /* Centring lives in the `translate` property rather than `transform`, so the
+     reverse mirror below can use `transform` without fighting it. */
+  translate: -50% -50%;
+  width: 125%;
+  height: 112%;
   pointer-events: none;
   z-index: 0;
-  /* The colour in play is the stroke; the fallback covers the moment before
-     the first card is turned, when there is no colour yet. */
-  color: var(--active-color, rgba(255, 255, 255, 0.45));
-  transition: transform 0.4s cubic-bezier(0.34, 1.4, 0.64, 1), color 0.45s ease;
-  filter: drop-shadow(0 0 10px var(--active-color, transparent));
-}
-.piles-arrow path {
-  fill: rgba(255, 255, 255, 0.03);
-  stroke: currentColor;
-  stroke-width: 3;
-  /* The viewBox is stretched to the box, so the stroke is pinned to device
-     pixels instead of being stretched unevenly with it. */
-  vector-effect: non-scaling-stroke;
-  stroke-linejoin: round;
-  stroke-linecap: round;
+  color: var(--uno-yellow);
+  opacity: 0.8;
+  filter: drop-shadow(0 0 10px rgba(252, 209, 22, 0.25));
 }
 
-/* Reversing mirrors the outline, so the arrowhead moves to the other side and
-   points the other way. A mirrored stroke keeps its colour. The transform is
-   transitioned so the swing reads as a turn rather than a jump. */
-.piles-arrow.reverse { transform: scaleX(-1); }
+/* Anticlockwise play: mirroring the whole ring flips the arrowhead and the
+   apparent travel of the dash together, so the head keeps pointing the way
+   play moves. Reversing only the animation would leave it pointing backwards. */
+.pile-loop.reverse { transform: scaleX(-1); }
+
+.pile-loop-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* A dash travelling along the arc. The shape itself must not spin: rotating a
+   non-circular ring about its centre would tumble the ellipse rather than show
+   movement around it. Animating the dash offset carries the eye around the
+   ring in the direction of play, which is the whole point. */
+.pile-loop-arc {
+  stroke-dasharray: 10 90;
+  animation: pileFlow 5.5s linear infinite;
+}
+
+@keyframes pileFlow {
+  from { stroke-dashoffset: 100; }
+  to   { stroke-dashoffset: 0; }
+}
+
+/* Motion is decoration: the direction is also stated in the banner, so
+   stopping the dash loses nothing. */
+@media (prefers-reduced-motion: reduce) {
+  .pile-loop-arc { animation: none; stroke-dasharray: none; }
+}
 
 .draw-deck-3d {
   width: var(--pile-w);
@@ -1344,7 +1390,9 @@ input { font-family: inherit; }
 .btn-start-game {
   position: relative;
   z-index: 30;
-  margin-top: calc(var(--u) * 14);
+  /* Clears the direction ring, whose arc curves below the cards: 14u left the
+     stroke within 2px of this button at every window size. */
+  margin-top: calc(var(--u) * 22);
   background: var(--danger);
   color: #fff;
   font-family: var(--font-mono);
