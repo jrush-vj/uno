@@ -49,6 +49,19 @@
      cluster falls back to before the first measurement lands. */
   --gap-unit: max(14px, calc(var(--u) * 24));
 
+  /* One type scale for the whole game view, in design px of the 1920x1276
+     frame with a px floor so nothing becomes unreadable on a small window.
+
+     The panels below (host settings, mid-game leaderboard, round summary) were
+     written with their own hardcoded sizes while everything on the table scales
+     from --u, so they disagreed with it in both directions: on a 1920x1080
+     monitor the turn banner grew while the settings rows stayed put, and inside
+     the banner a 13px timer chip sat next to 10px text. Every panel now takes
+     its size from here. */
+  --text-xs: max(10px, calc(var(--u) * 11));
+  --text-sm: max(10.5px, calc(var(--u) * 13));
+  --text-xl: max(14px, calc(var(--u) * 20));
+
   /* Legacy Figma tile origins, used only by the `.slot-*` labels. My own tile
      is marked by .slot-me but positioned in pixels by layoutTable(); the
      centre cluster is measured the same way, so it has no anchor here. */
@@ -335,7 +348,7 @@ input { font-family: inherit; }
   pointer-events: none;
 }
 .match-leaderboard-title {
-  font-size: 10px;
+  font-size: var(--text-xs);
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--text-muted);
@@ -345,7 +358,7 @@ input { font-family: inherit; }
   display: flex;
   align-items: baseline;
   gap: 7px;
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   padding: 2px 0;
 }
@@ -360,9 +373,9 @@ input { font-family: inherit; }
 .match-leaderboard .lb-mini-score { color: var(--accent); font-weight: 700; }
 
 @media (max-width: 900px) {
-  /* On a narrow table the leaderboard would cover a seat, so shrink it. */
+  /* On a narrow table the leaderboard would cover a seat, so shrink it. The
+     font size is left to the scale, which already floors on a small window. */
   .match-leaderboard { min-width: 0; max-width: 128px; padding: 6px 8px; }
-  .match-leaderboard .lb-mini { font-size: 10.5px; }
 }
 
 /* ==========================================================================
@@ -373,8 +386,8 @@ input { font-family: inherit; }
   right: max(12px, 2.2vw);
   top: max(70px, 7vh);
   z-index: 40;
-  width: 236px;
-  padding: 12px 13px;
+  width: max(210px, calc(var(--u) * 236));
+  padding: max(10px, calc(var(--u) * 12)) max(11px, calc(var(--u) * 13));
   border-radius: 14px;
   background: rgba(10, 10, 10, 0.94);
   border: 1px solid #2a2a2a;
@@ -382,7 +395,7 @@ input { font-family: inherit; }
 }
 .settings-panel.hidden { display: none; }
 .settings-title {
-  font-size: 11px;
+  font-size: var(--text-xs);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--accent);
@@ -394,7 +407,7 @@ input { font-family: inherit; }
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 8px;
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 .settings-row select {
@@ -403,7 +416,7 @@ input { font-family: inherit; }
   border: 1px solid #333;
   border-radius: 7px;
   padding: 4px 6px;
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 .settings-actions { display: flex; gap: 6px; margin-top: 4px; }
 .settings-actions button {
@@ -413,13 +426,14 @@ input { font-family: inherit; }
   border: 1px solid #34343a;
   background: #171717;
   color: #fff;
-  font-size: 11.5px;
+  /* was 11.5px, a value no other element in the app used */
+  font-size: var(--text-sm);
   cursor: pointer;
 }
 .settings-actions button:hover { border-color: var(--accent); }
 .settings-lock {
   margin-top: 8px;
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-muted);
 }
 
@@ -440,8 +454,8 @@ input { font-family: inherit; }
   transition: opacity 0.25s ease, transform 0.25s ease;
 }
 .round-toast.show { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-.round-toast h3 { font-size: 17px; margin-bottom: 8px; }
-.round-toast ul { list-style: none; font-size: 12.5px; color: var(--text-secondary); }
+.round-toast h3 { font-size: var(--text-xl); margin-bottom: 8px; }
+.round-toast ul { list-style: none; font-size: var(--text-sm); color: var(--text-secondary); }
 .round-toast li { margin-bottom: 3px; }
 .round-toast b { color: var(--accent); }
 
@@ -455,7 +469,11 @@ input { font-family: inherit; }
   color: var(--accent);
   font-family: var(--font-mono);
   font-weight: 700;
-  font-size: 13px;
+  /* Relative to the banner, so the chip can never outsize the text it sits
+     beside. It was a flat 13px, which made it larger than the 10px banner text
+     at 1280x720 and smaller than it at 1920x1080. The floor keeps it readable
+     once the banner itself hits its own floor. */
+  font-size: max(10px, 0.82em);
 }
 .turn-timer-chip.show { display: inline-block; }
 .turn-timer-chip.urgent {
@@ -1089,7 +1107,9 @@ input { font-family: inherit; }
   border-radius: 999px;
   background: rgba(8, 8, 8, 0.94);
   border: max(1px, calc(var(--u) * 1.5)) solid rgba(255, 255, 255, 0.16);
-  font-size: calc(var(--u) * 18);
+  /* Floored like every other size in the view: without it the banner shrank
+     below the panels it shares the screen with on a small window. */
+  font-size: max(11px, calc(var(--u) * 18));
   font-weight: 700;
   letter-spacing: 0.01em;
   color: var(--text-primary);
@@ -1128,7 +1148,7 @@ input { font-family: inherit; }
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: calc(var(--u) * 16);
+  font-size: max(10px, 0.85em);
   font-weight: 800;
   color: var(--accent);
   flex-shrink: 0;
@@ -1167,12 +1187,9 @@ input { font-family: inherit; }
 }
 
 /* ---- play-direction ring, wrapped around both piles.
-     Each dimension is a share of the pile group rather than of the viewport,
-     so the ring stays concentric with the cards at every resolution. The
-     width is deliberately larger than the height: the piles are wider than
-     they are tall, and the centre column is packed tightly between the turn
-     banner above and the hand below, so a circle wide enough to clear the
-     cards would run through both of them. ------------------------------- */
+     The width is a share of the pile group rather than of the viewport, so the
+     ring stays concentric with the cards at every resolution. Its aspect ratio
+     comes from the SVG viewBox so the ellipse is never distorted. --------- */
 .pile-loop {
   position: absolute;
   left: 50%;
@@ -1180,8 +1197,8 @@ input { font-family: inherit; }
   /* Centring lives in the `translate` property rather than `transform`, so the
      reverse mirror below can use `transform` without fighting it. */
   translate: -50% -50%;
-  width: 125%;
-  height: 112%;
+  width: 141%;
+  aspect-ratio: 225 / 109;
   pointer-events: none;
   z-index: 0;
   color: var(--uno-yellow);
@@ -1189,9 +1206,9 @@ input { font-family: inherit; }
   filter: drop-shadow(0 0 10px rgba(252, 209, 22, 0.25));
 }
 
-/* Anticlockwise play: mirroring the whole ring flips the arrowhead and the
-   apparent travel of the dash together, so the head keeps pointing the way
-   play moves. Reversing only the animation would leave it pointing backwards. */
+/* Anticlockwise play: mirroring the whole ring flips both arrowheads and the
+   travel of the shimmer together, so the heads keep pointing the way play
+   moves. Reversing only the animation would leave them pointing backwards. */
 .pile-loop.reverse { transform: scaleX(-1); }
 
 .pile-loop-svg {
@@ -1200,13 +1217,19 @@ input { font-family: inherit; }
   height: 100%;
 }
 
-/* A dash travelling along the arc. The shape itself must not spin: rotating a
-   non-circular ring about its centre would tumble the ellipse rather than show
-   movement around it. Animating the dash offset carries the eye around the
-   ring in the direction of play, which is the whole point. */
-.pile-loop-arc {
-  stroke-dasharray: 10 90;
-  animation: pileFlow 5.5s linear infinite;
+/* The loop itself is solid and still. An earlier version dashed the ring and
+   animated that dash, which painted only a tenth of it — there was no ring
+   left to read, just a stub circling an invisible path. */
+.pile-loop-track { stroke: currentColor; }
+
+/* Motion is a short bright segment travelling along the same two arcs, so it
+   reads as flow without hiding the loop. pathLength="100" on the arcs keeps
+   these fractions independent of the real arc length. */
+.pile-loop-flow {
+  stroke: #ffffff;
+  stroke-dasharray: 14 86;
+  opacity: 0.7;
+  animation: pileFlow 3.2s linear infinite;
 }
 
 @keyframes pileFlow {
@@ -1214,10 +1237,10 @@ input { font-family: inherit; }
   to   { stroke-dashoffset: 0; }
 }
 
-/* Motion is decoration: the direction is also stated in the banner, so
-   stopping the dash loses nothing. */
+/* Motion is decoration: the direction is already stated by the two arrowheads
+   and in the banner, so dropping the shimmer loses nothing. */
 @media (prefers-reduced-motion: reduce) {
-  .pile-loop-arc { animation: none; stroke-dasharray: none; }
+  .pile-loop-flow { display: none; }
 }
 
 .draw-deck-3d {
@@ -1818,7 +1841,10 @@ input { font-family: inherit; }
   outline: none;
   color: #ffffff;
   font-family: var(--font-roboto);
-  font-size: max(12px, calc(var(--u) * 18));
+  /* Matches the chat lines it feeds, so what you type is the size of what your
+     friends receive. It was 18u against their 14u, which made the box text
+     visibly larger than the transcript above it. */
+  font-size: max(10px, calc(var(--u) * 14));
   font-weight: 400;
   line-height: 1;
   user-select: text;

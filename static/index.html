@@ -296,28 +296,47 @@
       </div>
 
       <div class="table-piles">
-        <!-- Play-direction ring. It wraps the two piles so the direction reads
-             from the middle of the table, where the eye already is, instead of
-             only from the small glyph in the banner.
+        <!-- Play-direction ring: a loop of two arcs, each ending in an
+             arrowhead, wrapping the draw and discard piles so the direction
+             reads from the middle of the table rather than only from the small
+             glyph in the banner.
 
-             It is an ellipse, not a circle: the piles are wider than they are
-             tall, and the centre column is packed tightly between the turn
-             banner above and the hand below, so a circle of the width needed
-             to clear them would run straight through both. The path carries
-             pathLength="100" so the dash is exactly one tenth of the ring and
-             the dashoffset maths is independent of the real arc length. -->
+             It is an ellipse, not a circle. The piles are wider than they are
+             tall, and the centre column is packed between the turn banner and
+             the Start button, so a circle wide enough to clear the cards would
+             run through both.
+
+             The arrowheads sit at the far left and far right, where the ring
+             has room to spare, rather than at the top and bottom where the
+             banner and the button crowd it. Left-pointing-up plus
+             right-pointing-down is how clockwise reads.
+
+             The arcs are drawn solid. An earlier version dashed the ring
+             itself to animate it, which painted only a tenth of the loop and
+             left no ring to see; the motion is a separate shimmer on top. -->
         <span class="pile-loop" id="pileLoop" aria-hidden="true">
-          <svg class="pile-loop-svg" viewBox="0 0 200 112" fill="none"
+          <svg class="pile-loop-svg" viewBox="0 0 225 109" fill="none"
                stroke="currentColor" stroke-width="9"
                stroke-linecap="round" stroke-linejoin="round">
-            <!-- 300 degrees of the ellipse, leaving a gap centred on the top,
-                 then the arrowhead on the left end of that gap. The radii are
-                 chosen so the arc is tangent to the top and bottom of the
-                 cards: only 8px of clearance exists above the piles before
-                 the turn banner and 8px below before the Start button. -->
-            <path class="pile-loop-arc" pathLength="100"
-                  d="M 146 12.7 A 92 50 0 1 1 54 12.7"/>
-            <polyline points="56.04,19.19 67.84,8.36 51.96,6.21"/>
+            <defs>
+              <g id="pileLoopArcs">
+                <!-- lower arc, travelling right to left along the bottom -->
+                <path pathLength="100" d="M 203.61 61.46 A 92 50 0 0 1 21.40 61.46"/>
+                <!-- upper arc, travelling left to right along the top -->
+                <path pathLength="100" d="M 21.40 47.54 A 92 50 0 0 1 203.61 47.54"/>
+              </g>
+            </defs>
+
+            <use href="#pileLoopArcs" class="pile-loop-track"/>
+            <use href="#pileLoopArcs" class="pile-loop-flow"/>
+
+            <!-- arrowheads, one at the end of each arc. Each is drawn as a V
+                 straddling the direction of travel at that point: the bottom
+                 arc arrives travelling up-and-left, the top arc down-and-right,
+                 which is what clockwise looks like on the left and right of a
+                 ring. The two are point-symmetric about (112.5, 54.5). -->
+            <polyline points="18.12,79.16 21.40,61.46 32.85,75.35"/>
+            <polyline points="206.88,29.84 203.61,47.54 192.15,33.65"/>
           </svg>
         </span>
 
