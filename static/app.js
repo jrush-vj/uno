@@ -2796,15 +2796,22 @@ checkMic.addEventListener('change', () => localStorage.setItem('uno_pref_mic', c
    Play-direction arrowhead
    --------------------------------------------------------------------------
 
-The head is a triangle whose tip sits at its own origin, riding the rounded
-rectangular track around the two decks. Its position and facing are written to
-the `transform` attribute each frame.
+The head is a triangle that rides the rounded rectangular track around the two
+decks, drawn so its BASE straddles the stroke and its tip leads along the path.
+Its position and facing are written to the `transform` attribute each frame.
 
-That attribute is set directly rather than left to CSS or SMIL, because both
-of those were tried and both draw the shape wrong on an SVG child:
+Geometrically: the polygon is defined with the middle of its base at the local
+origin, so the transform places that point exactly on the track's centreline.
+The triangle then extends half its length ahead of the line and half behind,
+which is what makes it read as part of the stroke rather than a blob parked
+next to it. An earlier version put the TIP at the origin instead, so the whole
+body stuck out past the ring and only the tip touched the line.
+
+The `transform` attribute is set directly rather than left to CSS or SMIL,
+because both of those were tried and both draw the shape wrong on an SVG child:
 
   - A CSS transform resolves transform-origin against the viewBox, so rotate()
-    turned the head about the viewBox corner instead of its own tip. It left
+    turned the head about the viewBox corner instead of its own origin. It left
     the stroke and pointed backwards along the bottom edge.
   - The SMIL animateTransform version rendered nothing at all: the transform
     attribute stayed null and the shape kept a zero-sized box.
