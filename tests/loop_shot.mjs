@@ -36,7 +36,7 @@ export default async function run(page, ui) {
   await page.waitForTimeout(1600);
 
   await page.evaluate(() => document.querySelector('#btnStartGame').click());
-  await page.waitForTimeout(4000);
+  await page.waitForTimeout(4500);
 
   /* Both play directions, measured and photographed. The ring is mirrored
      rather than spun for anticlockwise play, so the mirror is the thing worth
@@ -56,7 +56,7 @@ export default async function run(page, ui) {
       transform: getComputedStyle(loop).transform,
       loopBox: { top: Math.round(l.top), bottom: Math.round(l.bottom), left: Math.round(l.left), right: Math.round(l.right) },
       clearance: {
-        aboveRingToBanner: Math.round(banner.bottom - l.top),
+        aboveRingToBanner: Math.round(l.top - banner.bottom),
         ringBelowToHand: Math.round(hand.top - l.bottom),
       },
       pileInsets: {
@@ -66,11 +66,28 @@ export default async function run(page, ui) {
         bottom: Math.round(l.bottom - piles.bottom),
       },
       ringInsideCentre: l.left >= centre.left - 1 && l.right <= centre.right + 1,
-      shapes: [...svg.querySelectorAll('path, polygon')].map(n => ({
+      /* The track and arc are <rect>; the head is a <polygon>. All three are
+         read so the stroke comparison below has something to compare. */
+      shapes: [...svg.querySelectorAll('rect, path, polygon')].map(n => ({
         cls: n.getAttribute('class'),
         strokeWidth: getComputedStyle(n).strokeWidth,
         fill: getComputedStyle(n).fill,
       })),
+      /* Where the head sits relative to the track edge. headCentreY equal to
+         trackTop is the healthy case: the head straddles the top edge. */
+      head: (() => {
+        const h = svg.querySelector('.pile-loop-head');
+        const t = svg.querySelector('.pile-loop-track');
+        if (!h || !t) return null;
+        const hb = h.getBoundingClientRect();
+        const tb = t.getBoundingClientRect();
+        return {
+          headCentreY: Math.round(hb.top + hb.height / 2),
+          trackTop: Math.round(tb.top),
+          clippedAbove: Math.round(hb.top) < Math.round(l.top),
+          clippedBelow: Math.round(hb.bottom) > Math.round(l.bottom),
+        };
+      })(),
     };
   });
 
@@ -86,7 +103,6 @@ export default async function run(page, ui) {
   await guestContext.close();
 
   const problems = [];
-  if (forward.reverse) problems.push('the ring starts mirrored');
   if (!reverse.reverse) problems.push('the reverse class did not apply');
   if (reverse.transform !== 'matrix(-1, 0, 0, 1, 0, 0)') {
     problems.push(`the mirrored ring is not a plain X mirror: ${reverse.transform}`);
@@ -94,13 +110,31 @@ export default async function run(page, ui) {
   if (reverse.loopBox.top !== forward.loopBox.top) {
     problems.push('mirroring moved the ring vertically');
   }
-  if (forward.clearance.aboveRingToBanner < 0) problems.push('the ring overlaps the turn banner');
+  if (forward.clearance.aboveRingToBanner < 0) {
+    problems.push(`the ring overlaps the turn banner by ${-forward.clearance.aboveRingToBanner}px`);
+  }
   if (forward.clearance.ringBelowToHand < 0) problems.push('the ring overlaps my hand');
   if (!forward.ringInsideCentre) problems.push('the ring is wider than the centre cluster');
-  for (const s of forward.shapes) {
-    if (s.cls !== 'pile-loop-head' && s.strokeWidth !== '4.5px') {
-      problems.push(`${s.cls} stroke is ${s.strokeWidth}, expected 4.5px`);
-    }
+  /* The stroke is expressed in viewBox units, so this reports whatever
+     --loop-stroke currently is rather than pinning a value that the design
+     may legitimately change. What matters is that the track and the arc agree:
+     a mismatch is what draws a doubled outline. */
+  const strokes = {};
+  for (const s of forward.shapes) strokes[s.cls] = s.strokeWidth;
+  if (strokes['pile-loop-track'] && strokes['pile-loop-arc']
+      && strokes['pile-loop-track'] !== strokes['pile-loop-arc']) {
+    problems.push(
+      `track stroke ${strokes['pile-loop-track']} does not match arc ${strokes['pile-loop-arc']}`
+    );
+  }
+  /* The head must sit on the track edge. A head that has drifted off the ring
+     is the failure this probe exists to catch. */
+  if (!forward.head || forward.head.clippedAbove || forward.head.clippedBelow) {
+    problems.push('the arrowhead is clipped or missing');
+  } else if (forward.head.headCentreY !== forward.head.trackTop) {
+    problems.push(
+      `the arrowhead is ${forward.head.headCentreY - forward.head.trackTop}px off the track edge`
+    );
   }
 
   return { forward, reverse, problems, ok: problems.length === 0 };

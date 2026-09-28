@@ -1154,11 +1154,12 @@ function renderGameState(state) {
     directionArrow.classList.add('direction-pop');
   }
 
-  /* The ring around the piles states the same thing from the middle of the
-     table. It is mirrored rather than spun backwards for anticlockwise play,
-     so its arrowhead always points along the turn order. */
+  /* The rectangular track around the piles states play direction and current color.
+     When direction is 1 (clockwise): play flows top deck left-to-right, bottom right-to-left.
+     When direction is -1 (counter-clockwise): mirrored, so arrow points opposite way. */
   if (pileLoop) {
     pileLoop.classList.toggle('reverse', state.direction === -1);
+    pileLoop.style.setProperty('--loop-color', state.current_color ? activeColor : 'var(--uno-yellow)');
   }
 
   colorOrb.style.background = activeColor;

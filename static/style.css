@@ -1175,7 +1175,7 @@ input { font-family: inherit; }
      2 * pile-w + 47u across and 1.5 * pile-w down. Insetting the ring by half
      a card each way puts its sides one card clear of the group's edges and its
      top and bottom level with the tops and bottoms of the cards, which is the
-     tightest ellipse that still leaves the arc on the felt everywhere. The
+     tightest ring that still leaves the stroke on the felt everywhere. The
      gap used to be a flat 47u — a whole card's worth of empty felt on either
      side of the ring, which read as a loose doodle rather than a frame around
      the piles. ---------------------------------------------------------- */
@@ -1186,70 +1186,79 @@ input { font-family: inherit; }
   /* Centring lives in the `translate` property rather than `transform`, so the
      reverse mirror below can use `transform` without fighting it. */
   translate: -50% -50%;
-  width: calc(100% + var(--pile-w));
-  height: calc(100% + var(--pile-w) * 0.5);
-  /* The ring's own glow. It has to be a drop-shadow on each shape rather than
-     one filter on the <svg>: a filter on a stretched viewBox is rasterised at
-     the wrong scale and the travelling dash disappears under it. */
-  --loop-glow: 0 0 6px rgba(252, 209, 22, 0.35);
+  width: calc(100% + var(--pile-w) * 0.36);
+  height: calc(100% + var(--pile-w) * 0.16);
+  --loop-color: var(--uno-yellow);
   pointer-events: none;
   z-index: 0;
-  color: var(--uno-yellow);
-  /* The stroke, not the whole element: opacity here would drag the glow down
-     with the ring and leave it looking washed out. */
-  --loop-stroke: 4.5;
+  color: var(--loop-color);
+  transition: color 0.35s ease, filter 0.35s ease;
+  /* In viewBox units and scaled with the drawing, so the ring keeps the same
+     visual weight against the cards at every window size. 3.5 was ~1px on a
+     typical table, which read as a hairline next to the 2px card borders. */
+  --loop-stroke: 7;
   opacity: 0.95;
 }
 
-/* Anticlockwise play: mirroring the whole ring flips the arrowhead and the
+/* Anticlockwise play: mirroring the rectangular loop flips the arrowhead and the
    apparent travel of the dash together, so the head keeps pointing the way
-   play moves. Reversing only the animation would leave it pointing backwards. */
+   play moves. */
 .pile-loop.reverse { transform: scaleX(-1); }
 
 .pile-loop-svg {
   display: block;
   width: 100%;
   height: 100%;
-  /* The viewBox is stretched, not scaled: a non-uniform scale would smear the
-     stroke into a ribbon and shear the arrowhead. vector-effect keeps the
-     stroke round and even on both axes instead. */
-  vector-effect: non-scaling-stroke;
 }
 
-/* The ring itself, and the travelling dash drawn over it. */
+/* The rectangular loop itself, and the travelling dash drawn over it.
+   No vector-effect: the stroke is meant to scale with the drawing, so its
+   weight stays proportional to the cards it frames instead of thinning out as
+   the table grows. vector-effect: non-scaling-stroke would also pin the dash
+   pattern to screen pixels while pathLength keeps the path in viewBox units,
+   which makes the gap under the arrowhead drift as the window resizes. */
 .pile-loop-track,
 .pile-loop-arc {
   stroke-width: var(--loop-stroke);
-  vector-effect: non-scaling-stroke;
-  filter: drop-shadow(var(--loop-glow));
+  filter: drop-shadow(0 0 6px currentColor);
 }
-.pile-loop-track { opacity: 0.5; }
+.pile-loop-track {
+  opacity: 0.38;
+  stroke: currentColor;
+}
 
-/* The head is a filled shape, so it has no stroke to keep even — only its own
-   opacity. It is drawn with the stroke colour so the solid head and the open
-   arc read as one mark, and it is what makes the ring a direction rather than
-   a frame. */
+/* The head is a filled shape pointing along the rectangular path. Its own
+   stroke is in user units like the rest of the drawing, so it stays constant
+   against the track and keeps the rounded join at the tip at every size. */
 .pile-loop-head {
   fill: currentColor;
   stroke: currentColor;
-  stroke-width: 0.5;
+  stroke-width: 1.6;
   stroke-linejoin: round;
   opacity: 0.95;
-  filter: drop-shadow(var(--loop-glow));
+  filter: drop-shadow(0 0 8px currentColor);
 }
 
-/* A dash travelling along the arc. The shape itself must not spin: rotating a
-   non-circular ring about its centre would tumble the ellipse rather than show
-   movement around it. Animating the dash offset carries the eye around the
-   ring in the direction of play, which is the whole point. */
+/* A dash travelling along the rectangular track.
+
+   The arc is the full outline (pathLength=100) and the dash is one travelling
+   segment of it, but it must be EMPTY everywhere the arrowhead sits or the
+   quiet stroke and the head fight over the same spot. The head occupies about
+   x=173..193 of the 340-wide top edge, so the gap is pinned to the top edge:
+   from 51% to 57.5% of the perimeter, with the travelling dash in the rest.
+
+   stroke-dashoffset animates by exactly one full perimeter (-100), so the dash
+   loops seamlessly: it leaves the top edge, goes all the way round, and returns
+   to the identical starting offset. ------------------------------------- */
 .pile-loop-arc {
-  stroke-dasharray: 12 88;
-  animation: pileFlow 6s linear infinite;
+  stroke: currentColor;
+  stroke-dasharray: 0 51.5 6.5 42;
+  animation: pileFlow 5s linear infinite;
 }
 
 @keyframes pileFlow {
-  from { stroke-dashoffset: 100; }
-  to   { stroke-dashoffset: 0; }
+  from { stroke-dashoffset: 0; }
+  to   { stroke-dashoffset: -100; }
 }
 
 /* Motion is decoration: the direction is also stated in the banner, so
