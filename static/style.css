@@ -1250,18 +1250,23 @@ input { font-family: inherit; }
   stroke: currentColor;
 }
 
-/* The head is a filled shape that travels the rectangular path.
+/* The head is a filled shape that travels the rectangular track.
 
-   It is positioned with offset-path rather than by animating x/y, so it
-   follows the same rounded-rectangle geometry as the track and inherits the
-   corner radii for free. offset-rotate: auto makes it face the way it is
-   going, so the head turns the corners with the path instead of sliding along
-   at a fixed angle.
+   It is animated with an explicit translate() + rotate() per keyframe rather
+   than with CSS offset-path. offset-path is a transform feature for HTML
+   boxes: on an SVG child Chrome does not position it along the path, and
+   offset-distance resolves against the element's own box instead of the path.
+   The head sat effectively still and never turned with the corners.
 
-   The path is written in the same user units as the viewBox (10,10 to 330,180,
-   r=24), so the head stays on the stroke at every window size. The dash below
-   carries the same gap, so the travelling head sits in the gap rather than on
-   top of a solid line. ------------------------------------------------- */
+   The keyframes below walk the track exactly. The track is a 320x170 rect at
+   (10,10) with r=24, so its straights are 272 across and 122 down and its
+   perimeter is 2*272 + 2*122 + 2*pi*24 = 938.8 units. Each keyframe places the
+   head's rotation origin - the middle of its base - on that outline.
+
+   transform-origin is the base of the triangle, not its centre, so the head
+   pivots about the point where it meets the line and the tip always leads the
+   base. A head rotated about its centre swings its base backwards on every
+   corner, which reads as the arrow trailing the path. ------------------- */
 .pile-loop-head {
   fill: currentColor;
   stroke: currentColor;
@@ -1269,17 +1274,27 @@ input { font-family: inherit; }
   stroke-linejoin: round;
   opacity: 0.95;
   filter: drop-shadow(0 0 8px currentColor);
-  offset-path: path('M 34,10 H 306 A 24,24 0 0 1 330,34 V 156 A 24,24 0 0 1 306,180 H 34 A 24,24 0 0 1 10,156 V 34 A 24,24 0 0 1 34,10 Z');
-  offset-rotate: auto;
-  offset-distance: 0%;
+  transform-box: view-box;
+  transform-origin: 0px 0px;
   animation: pileHead 5s linear infinite;
 }
 
-/* One full lap. offset-distance is a percentage of the path, so 0% -> 100%
-   is exactly one lap and the loop closes seamlessly. */
+/* One full lap, clockwise. 0deg points along +x, which is the direction of play
+   across the top edge. The percentage stops are the cumulative distance around
+   the 938.8-unit perimeter, so the head holds a constant speed through the
+   straights and the quarter-circle corners alike. */
 @keyframes pileHead {
-  from { offset-distance: 0%; }
-  to   { offset-distance: 100%; }
+  0%     { transform: translate(34px, 10px)   rotate(0deg); }
+  14.49% { transform: translate(170px, 10px)  rotate(0deg); }
+  29.0%  { transform: translate(306px, 10px)  rotate(0deg); }
+  33.0%  { transform: translate(330px, 34px)  rotate(90deg); }
+  46.0%  { transform: translate(330px, 156px) rotate(90deg); }
+  50.0%  { transform: translate(306px, 180px) rotate(180deg); }
+  64.5%  { transform: translate(170px, 180px) rotate(180deg); }
+  79.0%  { transform: translate(34px, 180px)  rotate(180deg); }
+  83.0%  { transform: translate(10px, 156px)  rotate(270deg); }
+  96.0%  { transform: translate(10px, 34px)   rotate(270deg); }
+  100%   { transform: translate(34px, 10px)   rotate(360deg); }
 }
 
 /* A dash travelling along the rectangular track.
@@ -1305,11 +1320,14 @@ input { font-family: inherit; }
 }
 
 /* Motion is decoration: the direction is also stated in the banner, so
-   stopping the travel loses nothing. The head is parked on the top edge so the
-   ring still reads as directional when motion is off. */
+   stopping the travel loses nothing. The head is parked mid-way along the top
+   edge so the ring still reads as directional when motion is off. */
 @media (prefers-reduced-motion: reduce) {
   .pile-loop-arc { animation: none; stroke-dasharray: none; opacity: 0; }
-  .pile-loop-head { animation: none; offset-distance: 30%; }
+  .pile-loop-head {
+    animation: none;
+    transform: translate(170px, 10px) rotate(0deg);
+  }
 }
 
 .draw-deck-3d {

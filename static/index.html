@@ -318,12 +318,10 @@
              meet edge to edge under the head instead of overshooting and
              showing a doubled stroke.
 
-             The track is inset 10 units on every side and the viewBox is
-             padded a further 12 beyond that, so the drawing spans -12..352 in
-             x and -12..202 in y. The padding is headroom for the arrowhead:
-             it is positioned by offset-path and rotates to follow the corners,
-             so its extremes sweep outside the track's own bounds and an SVG
-             clips to its viewBox. -->
+             The track is inset 10 units inside the 340x190 viewBox, and the
+             arrowhead rides that track. The head is placed by transform in the
+             stylesheet, in these same viewBox units, so it stays on the stroke
+             at any window size. -->
         <span class="pile-loop" id="pileLoop" aria-hidden="true">
           <!-- The viewBox matches the track (a 320x170 rect at 10,10 inside a
                340x190 box) so that, under preserveAspectRatio="none", one
@@ -340,17 +338,16 @@
                preserveAspectRatio="none"
                stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
             <!-- Rectangular track with rounded corners enclosing both decks.
-                 Coordinates are in the padded viewBox above: the track itself
-                 is 320 x 170 at (10,10), rx=ry=24.
+                 The track is a 320 x 170 rect at (10,10), rx=ry=24, inside the
+                 340 x 190 viewBox.
                  pathLength="100" normalises the perimeter so the travelling dash
                  is expressed as a percentage of the outline. -->
             <rect class="pile-loop-track" x="10" y="10" width="320" height="170" rx="24" ry="24" />
             <rect class="pile-loop-arc" x="10" y="10" width="320" height="170" rx="24" ry="24" pathLength="100" />
-            <!-- Arrowhead. It is positioned by offset-path in the stylesheet
-                 and travels one full lap of the track, so its coordinates here
-                 are a local shape only: the tip points along +x and the base
-                 sits behind it, because offset-rotate: auto turns the shape to
-                 face the direction of travel. -->
+            <!-- Arrowhead. Its local origin is the midpoint of its base, which is
+                 the point the stylesheet rotates about, so the tip leads the base
+                 all the way round. The tip points along +x: 0deg is the direction
+                 of play across the top edge. -->
             <polygon class="pile-loop-head"
                      points="20,0 0,-9 0,9" />
           </svg>
