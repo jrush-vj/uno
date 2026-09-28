@@ -247,6 +247,10 @@
           <option value="60">60 seconds</option>
         </select>
       </label>
+      <label class="settings-row">
+        <span>Sort my hand</span>
+        <input type="checkbox" id="setSortHand"/>
+      </label>
       <div class="settings-actions">
         <button type="button" id="btnShuffleSeats">Shuffle seats</button>
         <button type="button" id="btnArrangeSeats">Arrange</button>
@@ -275,6 +279,10 @@
             <span class="seat-score-text">0</span>
           </div>
           <div class="opp-card-tray"></div>
+          <!-- The exact hand size, directly under the fan. The fan itself
+               caps how many card backs it draws, so this label is what keeps
+               a 14-card hand from reading the same as a 10-card one. -->
+          <div class="opp-hand-count" hidden>0</div>
         </div>
       </div>
     </template>
@@ -323,40 +331,39 @@
              stylesheet, in these same viewBox units, so it stays on the stroke
              at any window size. -->
         <span class="pile-loop" id="pileLoop" aria-hidden="true">
-          <!-- The viewBox matches the track (a 320x170 rect at 10,10 inside a
-               340x190 box) so that, under preserveAspectRatio="none", one
-               viewBox unit maps to the same fraction of the box in both axes.
-               That keeps the CSS box and the drawn track the same rectangle.
+          <!-- The box aspect ratio is pinned to the viewBox (340:190) in the
+               stylesheet, so one viewBox unit maps to the SAME number of
+               pixels on both axes. That is what keeps the corners circular and
+               the arrowhead's heading true; the old box derived width and
+               height with two different factors (340/320 and 190/170) and
+               stretched the drawing into a slightly elliptical ring.
 
                The arrowhead sweeps outside the track when it rotates through a
                corner. That is handled by overflow:visible on the SVG rather
-               than by padding the viewBox: padding the viewBox desynchronises
-               the two axes under preserveAspectRatio="none", because the
-               horizontal and vertical scale factors differ once the viewBox
-               aspect ratio is no longer the box's. -->
+               than by padding the viewBox: padding the viewBox would break the
+               box's aspect ratio again. -->
           <svg class="pile-loop-svg" viewBox="0 0 340 190" fill="none"
-               preserveAspectRatio="none"
+               preserveAspectRatio="xMidYMid meet"
                stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
             <!-- Rectangular track with rounded corners enclosing both decks.
                  The track is a 320 x 170 rect at (10,10), rx=ry=24, inside the
                  340 x 190 viewBox.
-                 pathLength="100" normalises the perimeter so the travelling dash
-                 is expressed as a percentage of the outline. -->
+                 pathLength="100" normalises the perimeter so both the head's
+                 progress and the body's dash offset are in the same units: a
+                 percentage of one lap. app.js drives both from one number. -->
             <rect class="pile-loop-track" x="10" y="10" width="320" height="170" rx="24" ry="24" />
             <rect class="pile-loop-arc" x="10" y="10" width="320" height="170" rx="24" ry="24" pathLength="100" />
-            <!-- Arrowhead. It is shaped so the BASE straddles the stroke and the
-                 tip leads along the path, with the centroid sitting on the
-                 origin. Placing the origin on the track centreline then makes
-                 the triangle genuinely overlap the line instead of parking
-                 alongside it.
-
-                 The tip points along +x, which is why 0deg is the direction of
-                 travel across the top edge.
+            <!-- Arrowhead. Its BASE runs through the local origin (base midpoint
+                 at 0,0, half-width 9 either side) and its tip leads 14 units
+                 along +x, so +x is the direction of travel. Placing the origin
+                 on the track's centreline puts the line through the middle of
+                 the head, and the body's dash ends exactly on that origin -
+                 which is what makes head and body read as ONE arrow.
 
                  Position and facing are written to the transform attribute each
                  frame by driveLoopHead in app.js. See there for why it is not
                  driven by CSS or SMIL. -->
-            <polygon class="pile-loop-head" points="7,0 -7,-9 -7,9" />
+            <polygon class="pile-loop-head" points="14,0 0,-9 0,9" />
           </svg>
         </span>
 
@@ -512,6 +519,20 @@
     <div class="gameover-actions">
       <button class="btn-primary" id="btnPlayAgain" style="display:none;">Continue Playing</button>
       <button class="btn-secondary" id="btnBackToLobby">Back to Lobby</button>
+    </div>
+  </div>
+</div>
+
+<!-- Wild Draw Four challenge. Shown only to the player the Draw Four was
+     played against; everyone else just sees the banner wait. -->
+<div class="modal-overlay" id="modalChallenge">
+  <div class="modal-card">
+    <span class="victory-trophy">&#127183;</span>
+    <h3 id="challengeTitle">DRAW FOUR</h3>
+    <p id="challengeMsg">They played a Wild Draw Four against you.</p>
+    <div class="gameover-actions">
+      <button class="btn-primary" id="btnChallenge">Challenge!</button>
+      <button class="btn-secondary" id="btnAcceptDraw">Accept &amp; draw 4</button>
     </div>
   </div>
 </div>

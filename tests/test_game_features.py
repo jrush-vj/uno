@@ -63,9 +63,20 @@ class SettingsValidationTests(unittest.TestCase):
 
 
 class SeatOrderingTests(unittest.TestCase):
+    def key(self, room, token):
+        """The public seat key for a player. Seat orders are expressed in
+        these, NOT in session tokens: the order is chosen by a client, and a
+        client must never be given another player's credential."""
+        return room.players[token].seat_key
+
     def test_apply_seat_order_reseats_everyone(self):
         room = make_room(others=["bob", "cara", "dan"])
-        room.settings.seat_order = ["dan", "host", "cara", "bob"]
+        room.settings.seat_order = [
+            self.key(room, "dan"),
+            self.key(room, "host"),
+            self.key(room, "cara"),
+            self.key(room, "bob"),
+        ]
 
         apply_seat_order(room)
 
@@ -77,7 +88,7 @@ class SeatOrderingTests(unittest.TestCase):
     def test_players_missing_from_the_order_are_appended(self):
         room = make_room(others=["bob", "cara"])
         # only one player is named; the rest must still get a seat
-        room.settings.seat_order = ["cara"]
+        room.settings.seat_order = [self.key(room, "cara")]
 
         apply_seat_order(room)
 
@@ -85,13 +96,25 @@ class SeatOrderingTests(unittest.TestCase):
         self.assertEqual(seats, [1, 2, 3])
         self.assertEqual(room.players["cara"].seat, 1)
 
-    def test_a_stale_token_is_ignored(self):
+    def test_a_stale_key_is_ignored(self):
         room = make_room(others=["bob"])
-        room.settings.seat_order = ["ghost-token", "bob", "host"]
+        room.settings.seat_order = [
+            "ghost-key", self.key(room, "bob"), self.key(room, "host")
+        ]
 
         apply_seat_order(room)
 
         self.assertEqual(sorted(p.seat for p in room.players.values()), [1, 2])
+
+    def test_the_recorded_order_never_contains_a_session_token(self):
+        """The order round-trips through the client, so a token in it would
+        be a credential handed to every player."""
+        room = make_room(others=["bob", "cara"])
+        shuffle_seats(room)
+
+        for key in room.settings.seat_order:
+            for player in room.players.values():
+                self.assertNotEqual(key, player.token)
 
     def test_shuffle_seats_keeps_every_player_seated(self):
         room = make_room(others=["bob", "cara", "dan", "eve"])
@@ -188,13 +211,19 @@ class PublicStateTests(unittest.TestCase):
         self.assertEqual(state["round_number"], 3)
         self.assertEqual(state["max_seats"], 6)
 
-    def test_seat_tokens_let_the_host_send_an_order(self):
+    def test_seat_keys_let_the_host_send_an_order_without_exposing_tokens(self):
         room = make_room(others=["bob"])
 
         state = server.public_state(room)
 
-        self.assertEqual(state["seat_tokens"]["1"], "host")
-        self.assertEqual(state["seat_tokens"]["2"], "bob")
+        # The key names the seat; it must NOT be the credential that reclaims
+        # it. Broadcasting the token here let any player take over any seat.
+        self.assertEqual(state["seat_keys"]["1"], room.players["host"].seat_key)
+        self.assertEqual(state["seat_keys"]["2"], room.players["bob"].seat_key)
+        self.assertNotEqual(state["seat_keys"]["1"], "host")
+        self.assertNotIn("host", state["seat_keys"].values())
+        # Every seat key is distinct, or reordering would collapse two seats.
+        self.assertEqual(len(set(state["seat_keys"].values())), 2)
 
     def test_seconds_left_is_sent_rather_than_an_absolute_deadline(self):
         room = make_room(others=["bob"])

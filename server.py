@@ -45,6 +45,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -82,8 +83,14 @@ MAX_SEATS = 6
 UNO_CATCH_PENALTY = 2
 DRAW2_PENALTY = 2
 DRAW4_PENALTY = 4
+CHALLENGE_FAIL_PENALTY = 6      # challenger draws 6 when the Wild Draw Four was legal
 ACTION_CARD_POINTS = 20
 WILD_CARD_POINTS = 50
+
+# Official UNO is played to a points target: the first player to reach 500
+# wins the MATCH, not just the round. Rounds are scored for the cards left in
+# opponents' hands and the total carries across rounds.
+MATCH_TARGET_POINTS = 500
 
 # Allowed values for the host-controlled game settings. Anything outside
 # these lists is rejected rather than trusted from the client.
@@ -122,22 +129,39 @@ def shuffle_deck(deck: list) -> None:
     _fisher_yates_shuffle(deck)
 
 
+def make_card(color: str, value: str) -> dict:
+    """One card, with a unique id.
+
+    Extracted from build_deck() so the rules can be tested directly with a
+    known hand rather than by shuffling 108 cards until the deal happens to be
+    interesting. `id` only has to be unique within a hand for the play
+    protocol, so a counter plus a process-local tag is enough - and it makes a
+    failing test's card identifiable in the output.
+    """
+    return {
+        "color": color,
+        "value": value,
+        "id": f"{color}_{value}_{next(_CARD_ID_SEQ):06d}",
+    }
+
+
+_CARD_ID_SEQ = itertools.count()
+
+
 def build_deck() -> list[dict]:
     """Standard 108-card UNO deck, well shuffled."""
     deck: list[dict] = []
     for color in COLORS:
-        deck.append({"color": color, "value": "0"})
+        deck.append(make_card(color, "0"))
         for v in NUMBER_VALUES[1:]:
-            deck.append({"color": color, "value": v})
-            deck.append({"color": color, "value": v})
+            deck.append(make_card(color, v))
+            deck.append(make_card(color, v))
         for v in ACTION_VALUES:
-            deck.append({"color": color, "value": v})
-            deck.append({"color": color, "value": v})
+            deck.append(make_card(color, v))
+            deck.append(make_card(color, v))
     for _ in range(4):
-        deck.append({"color": "black", "value": "wild"})
-        deck.append({"color": "black", "value": "wild4"})
-    for card in deck:
-        card["id"] = f"{card['color']}_{card['value']}_{uuid.uuid4().hex[:8]}"
+        deck.append(make_card("black", "wild"))
+        deck.append(make_card("black", "wild4"))
     shuffle_deck(deck)
     return deck
 
@@ -187,6 +211,20 @@ class Player:
     seat: int
     name: str
     ws: Optional[WebSocket] = None
+    # A PUBLIC handle for this seat, used by the host's seat-ordering UI.
+    # Deliberately distinct from `token`: the token is the credential that
+    # reclaims a seat on reconnect, and the seat-ordering feature needs to
+    # send identifiers for every player to every client. Sending the tokens
+    # - which is what the code used to do - let any player read another's
+    # token out of the state message and take over their seat with a single
+    # `join`. This key can only be used to reorder seats.
+    seat_key: str = ""
+
+    def __post_init__(self) -> None:
+        # Always have one, so seat ordering cannot silently collapse two
+        # players onto the same key (which would reassign seats at random).
+        if not self.seat_key:
+            self.seat_key = uuid.uuid4().hex
     hand: list = field(default_factory=list)
     connected: bool = True
     called_uno: bool = False
@@ -199,6 +237,15 @@ class Player:
     last_drawn_card_id: Optional[str] = None
     round_points: int = 0          # points won in the most recent round
     lifetime_wins: int = 0         # reported by the stats store on join
+    # The UNO-catch window. Under the official rule an uncalled player is
+    # catchable from the moment they play down to one card until the next
+    # player takes their turn. `called_uno` alone cannot express that: it
+    # says whether they called, not whether they are still exposed. The
+    # window is anchored to the seat that followed them, so a Skip or a Draw
+    # Two (which jump the turn further than one seat) still closes it after
+    # exactly one turn rather than leaving them exposed for a whole round.
+    uno_catchable: bool = False
+    uno_grace_holder: Optional[int] = None
 
 
 @dataclass
@@ -223,6 +270,18 @@ class Room:
     settings: "GameSettings" = field(default_factory=GameSettings)
     round_number: int = 0
     turn_deadline: Optional[float] = None   # epoch seconds; None = no timer
+    # Rotating dealer: the player after the dealer leads each round, and the
+    # deal moves on every round so one seat cannot always go first.
+    dealer_seat: Optional[int] = None
+    # A Wild Draw Four awaiting a challenge from the player it was played
+    # against: {"by": seat, "against": seat, "legal": bool}. Bluffing is
+    # legal under the official rules - the card is not rejected, it is
+    # challengeable - so this is what lets the victim call the bluff.
+    pending_wild4: Optional[dict] = None
+    # Set when a player reaches the points target. No further round starts
+    # until the host begins a new match.
+    match_over: bool = False
+    match_winner_seat: Optional[int] = None
 
     def seat_order(self) -> list[int]:
         return sorted(p.seat for p in self.players.values())
@@ -318,6 +377,21 @@ def draw_from_deck(room: Room, n: int) -> list[dict]:
     return drawn
 
 
+def apply_draw_penalty(room: Room, victim: Optional[Player], count: int) -> None:
+    """Force a player to draw `count` cards (Draw Two / Wild Draw Four).
+
+    `sync_uno_flag` afterwards because a penalty can take a hand back out of
+    the 1-2 card range the UNO declaration only exists within, and a hand that
+    GROWS past one card can no longer be caught.
+    """
+    if victim is None:
+        return
+    victim.hand.extend(draw_from_deck(room, count))
+    victim.uno_catchable = False
+    victim.uno_grace_holder = None
+    sync_uno_flag(victim)
+
+
 def advance_turn(room: Room, steps: int = 1) -> None:
     """Move `steps` seats around the table in the current direction.
 
@@ -343,6 +417,20 @@ def advance_turn(room: Room, steps: int = 1) -> None:
         return
     idx = order.index(room.turn_seat)
     idx = (idx + steps * room.direction) % len(order)
+
+    # The official UNO-catch window closes as soon as the player who followed
+    # the exposed one finishes their turn. That player is the current holder,
+    # so leaving holder H closes the window of anyone whose grace was anchored
+    # to H. Doing it here rather than in the play handler is what makes a Skip
+    # and a Draw Two close the window the same way - they advance the turn
+    # through a different path, and an implementation that only watched the
+    # play handler left players catchable for a whole extra round.
+    leaving = room.turn_seat
+    for p in room.players.values():
+        if p.uno_grace_holder == leaving:
+            p.uno_catchable = False
+            p.uno_grace_holder = None
+
     room.turn_seat = order[idx]
     # Every turn change re-arms the clock, so the countdown always describes
     # the player who currently owes a move.
@@ -350,6 +438,18 @@ def advance_turn(room: Room, steps: int = 1) -> None:
 
 
 def card_playable(room: Room, card: dict) -> bool:
+    """Whether a card may be played on the current pile.
+
+    Wild and Wild Draw Four are playable on anything. Everything else matches
+    the live colour or the top card's value.
+
+    NOTE: the Wild Draw Four's extra restriction - it may only be played when
+    you hold no card of the current colour - is deliberately NOT checked here.
+    Under the official rules that restriction is enforced by the CHALLENGE
+    mechanism, not by rejecting the play: playing a Draw Four you were not
+    entitled to is a bluff, and the penalty for being caught is drawing it
+    yourself. See wild4_was_legal() and handle_challenge().
+    """
     if card["color"] == "black":
         return True
     if not room.discard:
@@ -358,11 +458,41 @@ def card_playable(room: Room, card: dict) -> bool:
     return card["color"] == room.current_color or card["value"] == top_value
 
 
+def wild4_was_legal(room: Room, player: Player, card: dict) -> bool:
+    """True if `player` was entitled to play this Wild Draw Four.
+
+    Legal only when the player holds NO card matching the live colour. The
+    played card itself is excluded (it is black, so it can never match), and
+    a same-colour Wild Draw Four played earlier in the hand is not relevant.
+    """
+    return not any(
+        c["color"] == room.current_color
+        for c in player.hand
+        if c["id"] != card["id"]
+    )
+
+
 def player_has_playable(room: Room, player: Player) -> bool:
     """True if the player currently holds at least one card that can be
     played on the discard pile. Used to decide whether a drawn turn can
     end automatically (no playable card) or must wait for a play."""
     return any(card_playable(room, c) for c in player.hand)
+
+
+def most_common_colour(player: Player) -> str:
+    """The colour to declare when a wild is played on the player's behalf.
+
+    Used only by the AFK watchdog and the turn timer: a real player picks, so
+    this exists to keep the table moving rather than to make a clever choice.
+    The colour they hold most of is the least surprising default, and it falls
+    back to red for a hand that is all wilds.
+    """
+    counts = {c: 0 for c in COLORS}
+    for card in player.hand:
+        if card["color"] in counts:
+            counts[card["color"]] += 1
+    best = max(COLORS, key=lambda c: counts[c])
+    return best if counts[best] else COLORS[0]
 
 
 # --------------------------------------------------------------------------
@@ -385,8 +515,13 @@ def settle_round(room: Room, winner: Player) -> int:
     """Award the round and return the winner's points for it.
 
     Under "official" scoring the winner takes the value of every card left in
-    opponents' hands. Under "wins" scoring the round is worth a flat amount so
+    opponents' hands — face value for numbers, 20 for Skip/Reverse/Draw Two,
+    50 for either Wild — and the first player to reach the 500-point target
+    wins the match. Under "wins" scoring the round is worth a flat amount so
     a casual table is not decided by how badly someone was left holding cards.
+
+    NOTE: hands must still hold their cards when this runs, so it is called
+    BEFORE clear_all_hands().
     """
     if room.settings.points_mode == "wins":
         pts = store.WIN_BONUS_POINTS
@@ -398,15 +533,47 @@ def settle_round(room: Room, winner: Player) -> int:
                     pts += card_points(c)
     winner.score += pts
     winner.round_points = pts
+
+    # "wins" mode is a round count, so a match never ends on points there: the
+    # target only means something when rounds are scored for card values.
+    if room.settings.points_mode == "official" and winner.score >= MATCH_TARGET_POINTS:
+        room.match_over = True
+        room.match_winner_seat = winner.seat
     return pts
 
 
-def record_round_stats(room: Room, winner: Player, round_points: int) -> None:
+def reset_match(room: Room) -> None:
+    """Clear a finished match so the host can start a fresh one.
+
+    Scores go back to zero, the dealer rotation restarts, and every round
+    counter is cleared; seating, settings and player identities are left
+    alone so nobody has to rejoin.
+    """
+    room.match_over = False
+    room.match_winner_seat = None
+    room.round_number = 0
+    room.dealer_seat = None
+    room.pending_wild4 = None
+    # A recorded seating order names players by seat key. Anyone who has left
+    # since it was recorded would keep a stale entry, so it is rebuilt from the
+    # players actually present.
+    room.settings.seat_order = [p.seat_key for p in room.players.values()]
+    for p in room.players.values():
+        p.score = 0
+        p.round_points = 0
+        p.hand = []
+        p.called_uno = False
+        p.uno_catchable = False
+        p.uno_grace_holder = None
+        p.drew_this_turn = False
+        p.last_drawn_card_id = None
+
+
+def record_round_stats(room: Room, winner: Player, round_points: int) -> list[dict]:
     """Build the per-player round summary the stats store records.
 
     A player is credited with one round played whether they won it or not, so
-    a win rate is meaningful. The UNO-call bonus is paid separately when the
-    call happens, not here.
+    a win rate is meaningful.
     """
     entries = []
     for p in room.players.values():
@@ -416,7 +583,10 @@ def record_round_stats(room: Room, winner: Player, round_points: int) -> None:
             "points": p.round_points if won else 0,
             "round_points": p.round_points if won else 0,
             "won": won,
-            "uno_calls": 1 if (p.called_uno and won) else 0,
+            # Must be read BEFORE clear_all_hands(), because playing the last
+            # card drops the hand to zero and sync_uno_flag() then clears the
+            # declaration - so checking it later reported 0 for every winner.
+            "uno_calls": 1 if (won and p.called_uno) else 0,
         })
     return entries
 
@@ -437,29 +607,60 @@ def leaderboard(room: Room, winner: Optional[Player] = None, round_points: int =
     return rows
 
 
+def game_over_payload(room: Room, winner: Player, round_points: int, all_time: list) -> dict:
+    """The message every seat receives when a round ends.
+
+    Extracted from the socket handler so the shape can be tested without
+    standing up two websockets and racing their frames. Must be called AFTER
+    settle_round() (which sets match_over) and BEFORE clear_all_hands() (which
+    empties the hands the leaderboard is built from).
+    """
+    return {
+        "type": "game_over",
+        "winner_seat": winner.seat,
+        "winner_name": winner.name,
+        "round_points": round_points,
+        "scores": leaderboard(room),
+        "all_time": all_time,
+        "round_number": room.round_number,
+        "points_mode": room.settings.points_mode,
+        # Official play is a match to 500: finishing a round is not the end
+        # unless somebody reached the target, and the host then starts the
+        # next match deliberately.
+        "match_over": room.match_over,
+        "match_winner_seat": room.match_winner_seat,
+        "match_target": MATCH_TARGET_POINTS,
+    }
+
+
 def apply_seat_order(room: Room) -> None:
     """Re-seat players according to the host's arrangement.
 
-    ``settings.seat_order`` holds tokens. Any player missing from it keeps a
-    seat after the arranged ones, so a stale order (someone left, someone
-    joined) degrades gracefully instead of failing.
+    ``settings.seat_order`` holds PUBLIC seat keys (see Player.seat_key), not
+    session tokens: the order is chosen in a client that was told those keys,
+    and now that tokens no longer leave the server the two cannot be
+    conflated. Any player missing from the order keeps a seat after the
+    arranged ones, so a stale order (someone left, someone joined) degrades
+    gracefully instead of failing.
     """
-    ordered = [t for t in room.settings.seat_order if t in room.players]
-    for token in room.players:
-        if token not in ordered:
-            ordered.append(token)
-    for index, token in enumerate(ordered, start=1):
-        room.players[token].seat = index
-    room.settings.seat_order = ordered
+    by_key = {p.seat_key: p for p in room.players.values()}
+    ordered = [by_key[k] for k in room.settings.seat_order if k in by_key]
+    placed = set(id(p) for p in ordered)
+    for p in room.players.values():
+        if id(p) not in placed:
+            ordered.append(p)
+    for index, player in enumerate(ordered, start=1):
+        player.seat = index
+    room.settings.seat_order = [p.seat_key for p in ordered]
 
 
 def shuffle_seats(room: Room) -> None:
     """Randomise seating, then persist the new order in the settings."""
-    tokens = list(room.players.keys())
-    for i in range(len(tokens) - 1, 0, -1):
+    players = list(room.players.values())
+    for i in range(len(players) - 1, 0, -1):
         j = random.SystemRandom().randint(0, i)
-        tokens[i], tokens[j] = tokens[j], tokens[i]
-    room.settings.seat_order = tokens
+        players[i], players[j] = players[j], players[i]
+    room.settings.seat_order = [p.seat_key for p in players]
     apply_seat_order(room)
 
 
@@ -477,8 +678,25 @@ def clear_all_hands(room: Room) -> None:
     for p in room.players.values():
         p.hand = []
         p.called_uno = False
+        p.uno_catchable = False
+        p.uno_grace_holder = None
         p.drew_this_turn = False
         p.last_drawn_card_id = None
+
+
+def next_dealer_seat(room: Room) -> Optional[int]:
+    """The dealer for the coming round: the next seat round the table.
+
+    The dealer rotates every round, which is what stops the lowest seat from
+    leading every single round. The first round has no previous dealer, so the
+    lowest seat deals it.
+    """
+    order = room.seat_order()
+    if not order:
+        return None
+    if room.dealer_seat not in order:
+        return order[0]
+    return order[(order.index(room.dealer_seat) + 1) % len(order)]
 
 
 def start_game(room: Room) -> None:
@@ -488,9 +706,12 @@ def start_game(room: Room) -> None:
     room.discard = []
     room.direction = 1
     room.round_number += 1
+    room.pending_wild4 = None
     for p in room.players.values():
         p.hand = draw_from_deck(room, room.settings.starting_cards)
         p.called_uno = False
+        p.uno_catchable = False
+        p.uno_grace_holder = None
         p.drew_this_turn = False
         p.last_drawn_card_id = None
         p.round_points = 0
@@ -503,17 +724,27 @@ def start_game(room: Room) -> None:
 
     room.discard = [first]
     room.current_color = first["color"]
+
+    # The dealer rotates; the player to their LEFT (the next seat in play
+    # order) leads. Round one has no previous dealer, so the lowest seat deals.
     order = room.seat_order()
-    room.turn_seat = order[0]
+    dealer = next_dealer_seat(room)
+    room.dealer_seat = dealer
+    if dealer is None:
+        room.turn_seat = order[0]
+    else:
+        leader_idx = (order.index(dealer) + room.direction) % len(order)
+        room.turn_seat = order[leader_idx]
     room.started = True
 
-    # turn_seat is already ON order[0] at kickoff, so an opening
-    # Skip / Draw-2 advances only ONE seat (skipping order[0] entirely).
+    # Opening-card rules, none of which apply until the match target is in
+    # play. turn_seat is already ON the leader at kickoff, so an opening
+    # Skip / Reverse / Draw-2 acts on whoever follows the leader.
     if first["value"] == "skip":
         advance_turn(room, 1)
     elif first["value"] == "reverse":
         room.direction = -1
-        # In 2-player UNO Reverse acts like a Skip: dealer plays again.
+        # In 2-player UNO Reverse acts like a Skip: the dealer leads again.
         if len(order) > 2:
             advance_turn(room, 1)
     elif first["value"] == "draw2":
@@ -524,13 +755,27 @@ def start_game(room: Room) -> None:
 
 
 def sync_uno_flag(player: Player) -> None:
-    """The 'called UNO' declaration only makes sense while a player holds
-    1 or 2 cards (you may call it as soon as you're about to play down to
-    your last card, or right up until you're caught at 1). Drop the flag
-    once a hand leaves that range — e.g. after drawing penalty cards — so
-    a stale declaration can never linger and matter later."""
+    """Keep the UNO declaration in step with the hand.
+
+    A declaration is only meaningful while a player holds 1 or 2 cards: you
+    may call it as you play down to your last card, and it stands while you
+    sit on one. Once a penalty drags the hand back out of that range the
+    declaration is dropped, and with it any exposure - a two-card hand cannot
+    be caught, so `uno_catchable` must fall away with the flag.
+    """
+    if len(player.hand) == 0:
+        # Going out on the last card. Keep the declaration: it is what the
+        # round summary records, and clearing it here is exactly why a winner
+        # was always credited with zero UNO calls. The next round's deal
+        # resets it via clear_all_hands().
+        player.uno_catchable = False
+        player.uno_grace_holder = None
+        return
     if len(player.hand) not in (1, 2):
         player.called_uno = False
+    if len(player.hand) != 1:
+        player.uno_catchable = False
+        player.uno_grace_holder = None
 
 
 def handle_play(room: Room, player: Player, card_id: str, chosen_color: Optional[str]) -> tuple[bool, Optional[Player]]:
@@ -548,11 +793,20 @@ def handle_play(room: Room, player: Player, card_id: str, chosen_color: Optional
       - if you have NO playable card at the start of your turn, you must
         draw; the draw handler auto-passes the turn if the drawn card
         is not playable.
+
+    Ordering detail that used to be wrong: the action-card penalty is applied
+    BEFORE the win check. Returning early when the hand emptied meant that
+    going out on a Draw Two or Wild Draw Four silently skipped the next
+    player's penalty, which the official rules still require.
     """
     if not room.started:
         raise ValueError("Game has not started yet")
     if room.turn_seat != player.seat:
         raise ValueError("Not your turn")
+    # A Wild Draw Four on the table is waiting for the victim to accept or
+    # challenge; no other play can be accepted until that is settled.
+    if room.pending_wild4:
+        raise ValueError("Waiting for the Wild Draw Four to be accepted or challenged")
     card = next((c for c in player.hand if c["id"] == card_id), None)
     if card is None:
         raise ValueError("That card is not in your hand")
@@ -566,16 +820,26 @@ def handle_play(room: Room, player: Player, card_id: str, chosen_color: Optional
     elif chosen_color:
         chosen_color = None
 
+    # Whether a Draw Four was legal is decided from the hand BEFORE the card
+    # leaves it, because the check is "did you hold a card of the live colour".
+    wild4_legal = card["value"] == "wild4" and wild4_was_legal(room, player, card)
+
     player.hand.remove(card)
+    # The pile colour is read by the Draw-Four legality helper, so it must be
+    # captured before the play rewrites it. (The helper already ran above.)
     room.discard.append(card)
     room.current_color = chosen_color if card["color"] == "black" else card["color"]
     # Preserve a pre-emptive UNO call made while the player still held 2
     # cards; only clear it if they never called and just dropped to 1.
     sync_uno_flag(player)
 
-    if len(player.hand) == 0:
-        room.started = False
-        return True, None  # winner
+    # Playing down to one card is the moment the catch window opens. The
+    # anchor is NOT set here: the turn is still on this player, so anchoring
+    # now would point the window at their own seat and the next `advance_turn`
+    # would immediately shut it again. It is anchored after the action branch
+    # has moved the turn, at the bottom of this function.
+    player.uno_catchable = len(player.hand) == 1 and not player.called_uno
+    player.uno_grace_holder = None
 
     value = card["value"]
     victim: Optional[Player] = None
@@ -589,6 +853,8 @@ def handle_play(room: Room, player: Player, card_id: str, chosen_color: Optional
         # Hop 2 seats: skip exactly one player.
         advance_turn(room, 2)
     elif value == "reverse":
+        # Flip first, then the hop follows the NEW direction, which is what
+        # makes a reverse read as "the other way now" rather than as a skip.
         room.direction *= -1
         # In 2-player UNO, Reverse acts like a Skip (same player goes again).
         if len(room.seat_order()) > 2:
@@ -596,20 +862,93 @@ def handle_play(room: Room, player: Player, card_id: str, chosen_color: Optional
     elif value == "draw2":
         advance_turn(room, 1)
         victim = room.player_by_seat(room.turn_seat)
-        if victim:
-            victim.hand.extend(draw_from_deck(room, DRAW2_PENALTY))
-            sync_uno_flag(victim)
+        apply_draw_penalty(room, victim, DRAW2_PENALTY)
         advance_turn(room, 1)
     elif value == "wild4":
         advance_turn(room, 1)
         victim = room.player_by_seat(room.turn_seat)
-        if victim:
-            victim.hand.extend(draw_from_deck(room, DRAW4_PENALTY))
-            sync_uno_flag(victim)
-        advance_turn(room, 1)
+        if wild4_legal:
+            # Nothing to dispute: the penalty lands immediately, exactly as a
+            # Draw Two would, and the hand that grew is returned so the caller
+            # can push it to that player. A challenge is only possible for a
+            # bluff, so this path has nothing pending.
+            apply_draw_penalty(room, victim, DRAW4_PENALTY)
+            advance_turn(room, 1)
+        else:
+            # The play stands (a Draw Four is always legal to put down) but the
+            # victim may now challenge it. The penalty is held in the pending
+            # state until they accept or challenge, and the turn deliberately
+            # stays on the player who laid it: `advance_turn` above only moved
+            # it onto the victim, so it is put back. Parking the turn on an
+            # empty seat instead would freeze the table, and leaving it on the
+            # victim would let them dodge the challenge by playing on.
+            room.turn_seat = player.seat
+            room.pending_wild4 = {
+                "by": player.seat,
+                "against": victim.seat if victim else None,
+                "legal": False,
+            }
+            # Nothing has been drawn, so there is no hand to send yet.
+            victim = None
     else:
         advance_turn(room, 1)
+
+    if len(player.hand) == 0:
+        room.started = False
+        # The round is over, so nothing is pending and nobody is exposed.
+        room.pending_wild4 = None
+        for p in room.players.values():
+            p.uno_catchable = False
+            p.uno_grace_holder = None
+        return True, victim  # winner
+
+    # Re-anchor the freshly opened window to the seat that actually acts next.
+    # The action branch has moved the turn by now, and for a Draw Two or a
+    # Skip that is further than one seat - anchoring before it ran would leave
+    # the window tied to a player who never gets to act.
+    if player.uno_catchable:
+        player.uno_grace_holder = room.turn_seat
     return False, victim
+
+
+def handle_challenge(room: Room, challenger: Player, accept: bool) -> tuple[bool, Optional[Player]]:
+    """Resolve a pending Wild Draw Four: the victim accepts, or challenges.
+
+    Returns (challenge_succeeded, player_who_must_be_sent_a_hand).
+
+    * **Accept** — they draw the four, and play continues from them.
+    * **Challenge** — if the Draw Four was a bluff the player who laid it draws
+      four instead and the challenger is off the hook; if it was legitimate
+      (it never is here, because a legal one is applied straight away) the
+      challenger draws six.
+    """
+    pending = room.pending_wild4
+    if pending is None:
+        raise ValueError("There is no Wild Draw Four to answer")
+    if challenger.seat != pending["against"]:
+        raise ValueError("Only the player it was played against can answer")
+
+    room.pending_wild4 = None
+    dealer = room.player_by_seat(pending["by"])
+    victim = room.player_by_seat(pending["against"])
+
+    if accept:
+        apply_draw_penalty(room, victim, DRAW4_PENALTY)
+        advance_turn(room, 1)
+        return False, victim
+
+    if pending["legal"]:
+        # A truthful Draw Four punishes the accuser with six cards.
+        apply_draw_penalty(room, victim, CHALLENGE_FAIL_PENALTY)
+        advance_turn(room, 1)
+        return False, victim
+
+    # Caught bluffing: the four they tried to hand out comes back to them, and
+    # the turn carries on from the challenger - they lose nothing.
+    apply_draw_penalty(room, dealer, DRAW4_PENALTY)
+    room.turn_seat = challenger.seat
+    arm_turn_timer(room)
+    return True, dealer
 
 
 def handle_draw(room: Room, player: Player) -> tuple[list[dict], bool]:
@@ -625,6 +964,10 @@ def handle_draw(room: Room, player: Player) -> tuple[list[dict], bool]:
         raise ValueError("Game has not started yet")
     if room.turn_seat != player.seat:
         raise ValueError("Not your turn")
+    # Drawing is not an answer to a Draw Four; the turn is parked on the victim
+    # until they accept or challenge.
+    if room.pending_wild4:
+        raise ValueError("Waiting for the Wild Draw Four to be accepted or challenged")
     if player.drew_this_turn:
         # Already drew a playable card — must play it, can't draw again.
         raise ValueError("You already drew a card this turn — play it")
@@ -633,6 +976,11 @@ def handle_draw(room: Room, player: Player) -> tuple[list[dict], bool]:
         advance_turn(room, 1)
         return [], False
     player.hand.extend(drawn)
+    # The hand GREW, so any earlier declaration no longer describes it: you
+    # announced a one-card hand, and drawing took that away. Clearing on growth
+    # is safe because playing only ever shrinks the hand - this cannot wipe the
+    # declaration a player makes as they play down to their last card.
+    player.called_uno = False
     sync_uno_flag(player)
 
     drawn_card = drawn[0]
@@ -649,14 +997,24 @@ def handle_draw(room: Room, player: Player) -> tuple[list[dict], bool]:
 
 
 def handle_call_uno(player: Player) -> None:
-    """A player may declare UNO as soon as they're down to 2 cards (i.e.
-    about to play their second-to-last card) all the way through holding
-    just 1 — matching how most UNO apps let you call it early so you
-    can't get caught by a faster opponent."""
+    """Declare UNO before playing your second-to-last card.
+
+    Official timing: you call as you are about to go down to one card. Calling
+    is what removes your exposure - an opponent can only catch a player who
+    played to one card without declaring, and only until the next player acts.
+
+    There is deliberately no point bonus. The old code paid 5 points per call
+    out of the winner's accumulated score, which is not a UNO rule and made
+    the scoreboard meaningless: the winner of a round is determined by the
+    cards left in opponents' hands, not by how loudly anyone announced.
+    """
     if len(player.hand) in (1, 2) and not player.called_uno:
         player.called_uno = True
-        # The bonus is paid once per round, at the moment of the call.
-        player.score += store.UNO_CALL_POINTS
+        # Declaring closes the window immediately: you cannot be caught for a
+        # hand you announced.
+        if len(player.hand) == 1:
+            player.uno_catchable = False
+            player.uno_grace_holder = None
 
 
 def arm_turn_timer(room: Room) -> None:
@@ -671,13 +1029,35 @@ def arm_turn_timer(room: Room) -> None:
         room.turn_deadline = None
 
 
-def handle_catch_uno(room: Room, target_seat: int) -> bool:
+def handle_catch_uno(room: Room, catcher: Player, target_seat: Optional[int]) -> bool:
+    """Catch a player sitting on one card without having declared UNO.
+
+    Three conditions, all of them official:
+
+    * the catch only counts while the target is still EXPOSED - i.e. from
+      playing their second-to-last card until the next player takes a turn.
+      Sitting on one uncalled card for several turns is no longer catchable.
+    * the target must not have declared.
+    * you cannot catch yourself. The old handler took any seat and never
+      compared it to the caller, so a player could hand themselves the
+      penalty (and, more usefully, an opponent could "catch" a seat that had
+      already called).
+    """
     target = room.player_by_seat(target_seat)
-    if target and len(target.hand) == 1 and not target.called_uno:
-        target.hand.extend(draw_from_deck(room, UNO_CATCH_PENALTY))
-        target.called_uno = True
-        return True
-    return False
+    if target is None or catcher is None:
+        return False
+    if target.seat == catcher.seat:
+        return False
+    if target.called_uno or not target.uno_catchable or len(target.hand) != 1:
+        return False
+    target.hand.extend(draw_from_deck(room, UNO_CATCH_PENALTY))
+    # Drawing penalty cards takes them out of the 1-2 range, which clears the
+    # declaration; set the flags explicitly so no later path can un-catch them.
+    target.called_uno = False
+    target.uno_catchable = False
+    target.uno_grace_holder = None
+    sync_uno_flag(target)
+    return True
 
 
 async def remove_player(room: Room, player: Player) -> Optional[Player]:
@@ -785,6 +1165,7 @@ def public_state(room: Room) -> dict:
                 "cam_on": p.cam_on,
                 "mic_on": p.mic_on,
                 "called_uno": p.called_uno,
+                "uno_catchable": p.uno_catchable,
                 "drew_this_turn": p.drew_this_turn,
                 "is_host": p.token == room.host_token,
                 "score": p.score,
@@ -803,9 +1184,11 @@ def public_state(room: Room) -> dict:
     return {
         "room": room.room_id,
         "seats": seats,
-        # Seat numbers to peer tokens. The host's seat-arranging UI needs to
-        # send an order the server can apply, and the server orders by token.
-        "seat_tokens": {str(p.seat): p.token for p in room.players.values()},
+        # Seat number to PUBLIC seat key, not the session token. The host's
+        # seat-arranging UI needs to name every player in an order the server
+        # can apply, and this message goes to the whole table - so it must
+        # carry something that can only reorder seats. See Player.seat_key.
+        "seat_keys": {str(p.seat): p.seat_key for p in room.players.values()},
         "turn_seat": room.turn_seat,
         "direction": room.direction,
         "current_color": room.current_color,
@@ -818,6 +1201,19 @@ def public_state(room: Room) -> dict:
         "settings": room.settings.to_json(),
         "round_number": room.round_number,
         "turn_seconds_left": seconds_left,
+        # A Wild Draw Four waiting on the player it was played against. The
+        # client shows Accept / Challenge for `against` and blocks input for
+        # everyone else. `legal` is never sent: whether it was a bluff is
+        # exactly what the challenge decides, and leaking it would make the
+        # choice trivial.
+        "pending_wild4": (
+            {"by": room.pending_wild4["by"], "against": room.pending_wild4["against"]}
+            if room.pending_wild4 else None
+        ),
+        "dealer_seat": room.dealer_seat,
+        "match_over": room.match_over,
+        "match_winner_seat": room.match_winner_seat,
+        "match_target": MATCH_TARGET_POINTS,
     }
 
 
@@ -883,6 +1279,52 @@ async def broadcast_chat(room: Room, player: Player, text: str) -> None:
 # --------------------------------------------------------------------------
 # Background loops
 # --------------------------------------------------------------------------
+
+def auto_take_turn(room: Room, player: Player) -> bool:
+    """Play a turn on behalf of a player who cannot take it.
+
+    Shared by the disconnected-player watchdog and the turn clock: both need
+    the same thing, which is to make the table move without inventing a rule
+    a present player would not have. Returns True when the turn was acted on.
+
+    This is the fix for two stalls that were live before:
+
+    * the watchdog used to refresh `last_seen` and broadcast ONLY when the
+      auto-draw passed the turn. If the auto-drawn card happened to be
+      playable the drawn flag was set, nothing was broadcast, `last_seen` was
+      never refreshed again (the `if not drew_this_turn` guard stayed false),
+      and the room froze until the 180s cleanup reaped the seat.
+    * the turn clock re-armed itself in that same case, so an idle player
+      could be timed out forever without the table ever advancing.
+
+    Both now play the forced card when there is one, and pass when there is
+    not - the same two options a present player has.
+    """
+    if room.pending_wild4:
+        # A Draw Four is waiting on the victim's answer; acting for anyone
+        # here would decide it for them.
+        return False
+
+    if not player.drew_this_turn:
+        handle_draw(room, player)
+
+    # handle_draw() clears drew_this_turn when the drawn card was unplayable
+    # and already passed the turn, so this only fires while a play is owed.
+    if player.drew_this_turn:
+        playable = next((c for c in player.hand if card_playable(room, c)), None)
+        if playable is None:
+            player.drew_this_turn = False
+            player.last_drawn_card_id = None
+            advance_turn(room, 1)
+        else:
+            colour = playable["color"]
+            if colour == "black":
+                colour = most_common_colour(player)
+            handle_play(room, player, playable["id"], colour)
+
+    player.last_seen = time.time()
+    return True
+
 
 async def _cleanup_loop() -> None:
     """Frees seats that have been disconnected past the grace period."""
@@ -1010,22 +1452,17 @@ async def _turn_watchdog_loop() -> None:
                     and not current.connected
                     and (time.time() - current.last_seen) > AUTO_SKIP_DISCONNECTED_SECONDS
                 ):
+                    # The same routine the turn clock uses, so a disconnected
+                    # player and an idle one are handled identically.
                     try:
-                        if not current.drew_this_turn:
-                            handle_draw(room, current)
-                            # If the drawn card was playable, the turn stays
-                            # with this (disconnected) player — they must
-                            # play it when they reconnect. Only broadcast
-                            # the auto-pass notice if the turn actually moved.
-                            if not current.drew_this_turn:
-                                current.last_seen = time.time()
-                                acted_player = current
+                        if auto_take_turn(room, current):
+                            acted_player = current
                     except ValueError:
                         pass
             if acted_player:
                 await broadcast_state(room)
                 await send_hand(acted_player)
-                await broadcast_notice(room, f"{acted_player.name} was away — drew and passed")
+                await broadcast_notice(room, f"{acted_player.name} was away — played on their behalf")
 
 
 async def _turn_timer_loop() -> None:
@@ -1050,14 +1487,16 @@ async def _turn_timer_loop() -> None:
                     room.turn_deadline = None
                     continue
                 try:
-                    if not current.drew_this_turn:
-                        handle_draw(room, current)
-                    # If a playable card was drawn the turn stays with them, so
-                    # the clock is re-armed rather than skipping them.
-                    arm_turn_timer(room)
-                    acted_player = current
+                    if auto_take_turn(room, current):
+                        acted_player = current
                 except ValueError:
                     room.turn_deadline = None
+            if acted_player:
+                await broadcast_state(room)
+                await send_hand(acted_player)
+                await broadcast_notice(
+                    room, f"{acted_player.name} ran out of time — played on their behalf"
+                )
             if acted_player:
                 await broadcast_state(room)
                 await send_hand(acted_player)
@@ -1152,6 +1591,7 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                         player = Player(
                             token=new_token,
                             peer_id=uuid.uuid4().hex,
+                            seat_key=uuid.uuid4().hex,
                             seat=seat,
                             name=name,
                             ws=websocket,
@@ -1204,6 +1644,11 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                         if len(room.players) < 2:
                             await send_json(websocket, {"type": "error", "message": "Need at least 2 players"})
                             continue
+                        # A finished match must be cleared before another round, or
+                        # the old scores carry into it and the target is reached
+                        # again on the first win.
+                        if room.match_over:
+                            reset_match(room)
                         start_game(room)
                         arm_turn_timer(room)
                     await broadcast_state(room)
@@ -1288,19 +1733,11 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
                         # Record lifetime scores before the round is reset, so
                         # the leaderboard survives a restart.
                         await stats_store.record_round(stats_entries)
-                        board = leaderboard(room)
                         all_time = await stats_store.top_players(8)
                         for p in room.players.values():
-                            await send_json(p.ws, {
-                                "type": "game_over",
-                                "winner_seat": player.seat,
-                                "winner_name": player.name,
-                                "round_points": round_points,
-                                "scores": board,
-                                "all_time": all_time,
-                                "round_number": room.round_number,
-                                "points_mode": room.settings.points_mode,
-                            })
+                            await send_json(p.ws, game_over_payload(
+                                room, player, round_points, all_time
+                            ))
                         for p in room.players.values():
                             await send_hand(p)
                     else:
@@ -1319,13 +1756,34 @@ async def ws_endpoint(websocket: WebSocket, room_id: str) -> None:
             elif mtype == "catch_uno":
                 target_seat = msg.get("target_seat")
                 async with room.lock:
-                    ok = handle_catch_uno(room, target_seat)
+                    ok = handle_catch_uno(room, player, target_seat)
                 if ok:
                     await broadcast_state(room)
                     victim = room.player_by_seat(target_seat)
                     if victim:
                         await send_hand(victim)
                         await broadcast_notice(room, f"{victim.name} got caught without calling UNO!")
+                else:
+                    await send_json(websocket, {
+                        "type": "error",
+                        "message": "That player is not catchable",
+                    })
+
+            # ---- wild draw four: accept or challenge ----------------------
+            elif mtype == "challenge_wild4":
+                accept = bool(msg.get("accept"))
+                try:
+                    async with room.lock:
+                        caught, charged = handle_challenge(room, player, accept)
+                    await broadcast_state(room)
+                    if charged:
+                        await send_hand(charged)
+                    if caught:
+                        await broadcast_notice(room, f"{player.name} challenged and caught the bluff!")
+                    elif accept:
+                        await broadcast_notice(room, f"{player.name} drew four")
+                except ValueError as e:
+                    await send_json(websocket, {"type": "error", "message": str(e)})
 
             # ---- manual exit ----------------------------------------------
             elif mtype == "leave":

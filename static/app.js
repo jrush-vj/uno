@@ -8,6 +8,10 @@ let mySeat = null;
 let myRoom = 'main';
 let myCards = [];
 let currentGameState = null;
+/* The previous state, kept only so actionFeedback() can diff the two and say
+   what actually changed. Without it a Skip and a normal play look identical
+   from the outside. */
+let previousState = null;
 let wasMyTurn = false;
 let pendingWildCardId = null;
 
@@ -170,13 +174,9 @@ const gameOverMsg = $('gameOverMsg');
 const leaderboardBox = $('leaderboardBox');
 const btnPlayAgain = $('btnPlayAgain');
 const btnBackToLobby = $('btnBackToLobby');
-
-/* Seats are addressed by seat number now. The generated tiles and their arc
-   positions are managed by layoutTable() further down. */
-function opponentPod(seatNum) {
-  const node = seatNodes.get(Number(seatNum));
-  return node ? node.querySelector('.player-pod') : null;
-}
+const modalChallenge = $('modalChallenge');
+const btnChallenge = $('btnChallenge');
+const btnAcceptDraw = $('btnAcceptDraw');
 
 function showToast(msg, duration = 3500) {
   const tc = document.getElementById('toast-container') || document.body;
@@ -533,7 +533,12 @@ function layoutTable(seatNumbers) {
      was 15px. */
   const span = rise * (sinPeak - sinLow);
   let ringH = total ? tileH + span : 0;
-  const gapCount = total ? 4 : 3;
+  /* One gap per seam, always: above the ring, below the ring, below the centre
+     cluster, below my tile. The no-opponent case used to use 3 to match the
+     bands it actually has, which made a table with nobody seated compute a
+     different gap from the same code path - the bands then jumped when the
+     first guest sat down. */
+  const gapCount = 4;
   let gap = Math.round((available - (ringH + centreH + myPodH)) / gapCount);
 
   /* A tall table can be left with less space than the bands need. The arc is
@@ -543,6 +548,18 @@ function layoutTable(seatNumbers) {
     const budget = Math.max(tileH, available - minGap * gapCount - centreH - myPodH);
     ringH = budget;
     gap = Math.max(4, Math.round((available - (ringH + centreH + myPodH)) / gapCount));
+  }
+
+  /* The gaps are the only thing separating bands that would otherwise touch
+     (the direction ring already passes within a stroke width of the turn
+     banner and the Start Game button). Claiming the floor in full - and taking
+     it back from the arc, which is decoration - is what keeps the cluster
+     legible when the window is short. */
+  const gapFloor = Math.max(8, Math.round(layerH * 0.008));
+  if (gap < gapFloor) {
+    gap = gapFloor;
+    const room = available - (gap * gapCount + centreH + myPodH);
+    if (total && room > 0) ringH = Math.max(Math.min(ringH, room), tileH);
   }
 
   /* Walk the bands down the play area. The ring band is skipped entirely when
@@ -736,30 +753,32 @@ function paintSeatOrderBadges() {
 }
 
 function currentSeatTokenOrder() {
-  /* The server orders by token; the client only knows seats. It maps each
-     seat back to the peer token it is displaying, taken from the last state. */
+  /* The server orders by PUBLIC seat key, not by session token. The client
+     only knows seats, so it maps each seat back to the key it is displaying,
+     taken from the last state. */
   const seats = [...seatNodes.keys()].sort((a, b) => a - b);
   const order = [];
   seats.forEach(seatNum => {
-    const token = seatTokenBySeat[seatNum];
-    if (token) order.push(token);
+    const key = seatKeyBySeat[seatNum];
+    if (key) order.push(key);
   });
   return order;
 }
 
-/* seat -> peer token, refreshed from every state push so the host can send an
-   order the server can act on. */
-const seatTokenBySeat = {};
+/* seat -> public seat key, refreshed from every state push so the host can
+   send an order the server can act on. This is NOT the session token. */
+const seatKeyBySeat = {};
+const seatTokenBySeat = seatKeyBySeat;
 
 function swapSeats(a, b) {
   if (a == null || b == null || a === b) return;
   const order = [...seatNodes.keys()].sort((n, n2) => n - n2);
-  const tokensBySeat = order.map(seatNum => seatTokenBySeat[seatNum]);
+  const keysBySeat = order.map(seatNum => seatKeyBySeat[seatNum]);
   const ia = order.indexOf(a);
   const ib = order.indexOf(b);
   if (ia < 0 || ib < 0) return;
-  [tokensBySeat[ia], tokensBySeat[ib]] = [tokensBySeat[ib], tokensBySeat[ia]];
-  sendServerMessage({ type: 'seat_order', order: tokensBySeat.filter(Boolean) });
+  [keysBySeat[ia], keysBySeat[ib]] = [keysBySeat[ib], keysBySeat[ia]];
+  sendServerMessage({ type: 'seat_order', order: keysBySeat.filter(Boolean) });
 }
 
 function wireSeatDragging() {
@@ -1096,14 +1115,19 @@ function renderGameState(state) {
   const dealing = dealInProgress;
   if (dealing) state = Object.assign({}, state, { turn_seat: null });
 
+  actionFeedback(previousState, state);
+  previousState = state;
+
   updateSeatToSlotMapping(state.seats);
 
-  /* Remember which token sits in which seat so the host can send a seating
-     order the server can act on (the server orders by token). */
-  Object.keys(seatTokenBySeat).forEach(k => delete seatTokenBySeat[k]);
-  if (state.seat_tokens) {
-    Object.entries(state.seat_tokens).forEach(([seat, token]) => {
-      seatTokenBySeat[Number(seat)] = token;
+  /* Remember which public seat key sits in which seat, so the host can send a
+     seating order the server can act on. These are NOT session tokens; the
+     server no longer sends those, because doing so let any player read
+     another's credential and take over their seat. */
+  Object.keys(seatKeyBySeat).forEach(k => delete seatKeyBySeat[k]);
+  if (state.seat_keys) {
+    Object.entries(state.seat_keys).forEach(([seat, key]) => {
+      seatKeyBySeat[Number(seat)] = key;
     });
   }
 
@@ -1143,6 +1167,27 @@ function renderGameState(state) {
     turnBannerText.textContent = `⏳ ${activeName}'s turn`;
   }
 
+  /* A Wild Draw Four waiting on an answer takes over the banner: the table is
+     paused, so "whose turn is it" is no longer the useful thing to say. Only
+     the player it was played against gets the buttons; everyone else is told
+     to wait, which is what stops them wondering why nothing is happening. */
+  const pending = state.pending_wild4;
+  if (pending && !dealing) {
+    const againstMe = pending.against === mySeat;
+    if (againstMe) {
+      turnBannerText.textContent = '⚔️ Draw Four on you — accept or challenge?';
+      if (!modalChallenge.classList.contains('active')) modalChallenge.classList.add('active');
+    } else {
+      const bluffer = state.seats[String(pending.by)];
+      const victim = state.seats[String(pending.against)];
+      turnBannerText.textContent = `⚔️ ${victim ? victim.name : 'A player'} is deciding on ${bluffer ? bluffer.name : 'a'}'s Draw Four`;
+    }
+  } else if (modalChallenge.classList.contains('active')) {
+    /* The answer landed (or the round ended): the prompt must not survive it
+       and leave the table looking paused. */
+    modalChallenge.classList.remove('active');
+  }
+
   const activeColor = CARD_COLORS[state.current_color] || '#3f3f46';
   feltTable.style.setProperty('--active-color', state.current_color ? activeColor : 'transparent');
 
@@ -1170,7 +1215,11 @@ function renderGameState(state) {
   deckCountLabel.textContent = String(state.draw_pile_count || 0);
   const myState = state.seats[String(mySeat)];
   const myDrew = myState ? !!myState.drew_this_turn : false;
-  btnDrawDeck.classList.toggle('disabled', !isMyTurn || !state.started || myDrew);
+  /* A pending Draw Four parks the turn, so drawing is not a legal answer
+     either - it would let the victim sidestep the challenge entirely. */
+  btnDrawDeck.classList.toggle('disabled', !isMyTurn || !state.started || myDrew || !!pending);
+  /* Drawing is impossible while a Draw Four is waiting on an answer. */
+  if (pending) btnDrawDeck.classList.add('disabled');
 
   if (state.top_card) {
     const key = `${state.top_card.color}_${state.top_card.value}`;
@@ -1194,16 +1243,25 @@ function renderGameState(state) {
   renderMyHand();
 }
 
-/* Opponent card counts live in the centre void — one pill per opponent,
-   ordered the same way the seats sit around the table (left, across, right),
-   so a hand count is never attached to the wrong face on screen. */
+/* Catch alerts live in the centre void — one pill per player sitting on one
+   card without having called UNO. Each opponent's hand SIZE is printed under
+   their own cards, so this row only carries the actionable part: who can be
+   caught, and the button that does it. Ordered the same way the seats sit
+   around the arc, so an alert is never attached to the wrong face on screen. */
 const centreSeatEls = {};
 let centreSeatKey = '';
 
 function centreSeatOrder() {
-  /* Ordered exactly as the tiles sit around the arc, so a centre hand-count
-     pill is never attached to the wrong face on screen. */
-  return [...seatNodes.keys()].sort((a, b) => a - b);
+  /* Exactly the seats that are catchable, in arc order. */
+  const state = currentGameState;
+  if (!state || !state.started || dealInProgress) return [];
+  return [...seatNodes.keys()]
+    .sort((a, b) => a - b)
+    .filter(seatNum => {
+      if (seatNum === mySeat) return false;
+      const info = state.seats[String(seatNum)];
+      return !!info && info.hand_count === 1 && !info.called_uno;
+    });
 }
 
 function renderCentreSeats(state) {
@@ -1219,7 +1277,7 @@ function renderCentreSeats(state) {
       el.dataset.seat = String(seatNum);
       el.innerHTML = '<span class="cs-card"></span>'
         + '<span class="cs-name"></span>'
-        + '<span class="cs-count">0</span>'
+        + '<span class="cs-count">UNO!</span>'
         + '<button class="cs-catch" type="button">Catch!</button>';
       el.querySelector('.cs-catch').onclick = () => sendServerMessage({ type: 'catch_uno', target_seat: seatNum });
       centreSeatEls[seatNum] = el;
@@ -1231,38 +1289,98 @@ function renderCentreSeats(state) {
     const el = centreSeatEls[seatNum];
     const info = state && state.seats[String(seatNum)];
     if (!el || !info) return;
-    const count = dealInProgress
-      ? (dealRevealed[seatNum] || 0)
-      : (state.started ? (info.hand_count || 0) : 0);
-    const uncaught = count === 1 && !info.called_uno && !dealInProgress;
     el.querySelector('.cs-name').textContent = info.name || `Seat ${seatNum}`;
-    el.querySelector('.cs-count').textContent = uncaught ? 'UNO!' : String(count);
-    el.classList.toggle('uno-alert', uncaught);
     el.classList.toggle('is-turn', !!(state.started && state.turn_seat === seatNum));
   });
 }
 
-/* Each opponent shows a small fan of face-down cards tucked under their
-   camera tile — Figma: 44x66 backs on a 40px pitch, centred on the tile.
-   The fan is capped and the pitch compresses so a big hand never overflows. */
-const MAX_BACKS_SHOWN = 8;
-const FAN_MAX_W = 264;
-const FAN_PITCH = 40;
+/* Each opponent shows an arch of face-down cards under their camera tile,
+   with their exact hand size printed directly below it.
+
+   Two things this fixes. The fan used to be a flat row, and it drew at most
+   MAX_BACKS_SHOWN backs, so a 25-card hand and an 8-card hand looked identical -
+   the count only existed in the centre pill row, far from the seat it
+   described. Now the arch splay carries the shape of the hand, the row is
+   capped (a 25-card fan is a solid slab, not information), and the exact
+   number is stated under the cards. */
+const MAX_BACKS_SHOWN = 10;
+const FAN_ANGLE_MAX_SCALE = 7;   // degrees of splay per card
+const FAN_ANGLE_MAX = 68;        // total splay ceiling, so a big hand stays sane
+
+function layoutOpponentFan(fan) {
+  /* Fan the cards into an arch, symmetric about the tile's centre, pivoting on
+     each card's BASE so the bottoms stay in a row and only the tops splay.
+
+     The step is measured from the rendered card, so it scales with the tile at
+     every seat count; the fan is then kept inside the tile's own width. The
+     previous version mixed a raw px pitch from JS with a u-scaled card width,
+     which inverted the overlap into a gap as the window narrowed. */
+  const backs = [...fan.querySelectorAll('.card-back')];
+  if (!backs.length) return;
+
+  const cardW = backs[0].offsetWidth || 30;
+  const cardH = backs[0].offsetHeight || cardW * 1.5;
+  const slot = fan.closest('.seat-slot');
+  const slotW = (slot && slot.offsetWidth) || cardW * 4;
+
+  /* A fifth of a card of overlap at most, and never so tight that the arched
+     tops merge into one another. */
+  let step = cardW * 0.62;
+  if (backs.length > 1) {
+    const maxStep = (slotW * 0.98 - cardW) / (backs.length - 1);
+    step = Math.max(cardW * 0.18, Math.min(step, maxStep));
+  }
+  fan.style.setProperty('--fan-step', `${(step - cardW).toFixed(1)}px`);
+
+  /* Splay: a constant angle per card, capped so a full hand does not fold back
+     on itself. The arch is then dropped by the sagitta of that arc, so the
+     cards stay inside the tray rather than sagging out of the tile. */
+  const angleTotal = Math.min(FAN_ANGLE_MAX, (backs.length - 1) * FAN_ANGLE_MAX_SCALE);
+  const perCard = backs.length > 1 ? angleTotal / (backs.length - 1) : 0;
+  const mid = (backs.length - 1) / 2;
+  const sag = cardH * (1 - Math.cos((angleTotal / 2) * Math.PI / 180)) * 0.55;
+
+  backs.forEach((back, i) => {
+    back.style.zIndex = String(10 + i);
+    /* The "+N" tile states a number; rotating it would tilt the digits, and it
+       is the tail of the fan rather than a card in it. */
+    if (back.classList.contains('more')) {
+      back.style.transform = `rotate(${((backs.length - 1 - mid) * perCard).toFixed(2)}deg) scale(0.86)`;
+      return;
+    }
+    /* translateY BEFORE rotate, so the drop is a real vertical shift in the
+       tray's frame and the rotation happens about the card's own base. */
+    back.style.transform = `translateY(${sag.toFixed(1)}px) rotate(${((i - mid) * perCard).toFixed(2)}deg)`;
+  });
+}
 
 function renderOpponentFan(pod, count) {
   /* During a deal the fan grows one card at a time via appendOpponentBack(). */
   if (dealInProgress) return;
   const tray = pod.querySelector('.opp-card-tray');
+  const label = pod.querySelector('.opp-hand-count');
   if (!tray) return;
+
   /* Outside a live round no opponent is holding anything. */
   const live = !!(currentGameState && currentGameState.started);
-  const shown = live ? Math.min(count || 0, MAX_BACKS_SHOWN) : 0;
+  const held = count || 0;
+  const shown = live ? Math.min(held, MAX_BACKS_SHOWN) : 0;
+  const overflow = live ? Math.max(0, held - shown) : 0;
+
+  /* The exact size always goes under the fan - including during the deal,
+     where the label counts up card by card. */
+  if (label) {
+    label.textContent = held === 1 ? 'UNO!' : `${held} CARD${held === 1 ? '' : 'S'}`;
+    label.hidden = !live || !held;
+    label.classList.toggle('uno-alert', live && held === 1);
+  }
+
   const existing = tray.querySelector('.opp-card-fan');
   if (!shown) {
     if (existing) tray.innerHTML = '';
     return;
   }
-  if (existing && existing.childElementCount === shown) return;
+  if (existing && existing.childElementCount === shown + (overflow ? 1 : 0)) return;
 
   tray.innerHTML = '';
   const fan = document.createElement('div');
@@ -1274,8 +1392,16 @@ function renderOpponentFan(pod, count) {
     back.innerHTML = '<div class="back-oval"><span class="back-uno">UNO</span></div>';
     fan.appendChild(back);
   }
-  applyFanPitch(fan);
+  if (overflow) {
+    /* A trailing "+N" tile, so the shape of the fan still distinguishes a
+       hand at the cap from one past it. */
+    const more = document.createElement('div');
+    more.className = 'card-back more';
+    more.textContent = `+${overflow}`;
+    fan.appendChild(more);
+  }
   tray.appendChild(fan);
+  layoutOpponentFan(fan);
 }
 
 function renderOpponentPod(seatNum, info, state) {
@@ -1366,6 +1492,23 @@ function renderMyPod(info, state) {
 
 /* The hand sits at the bottom of the centre void, so the row has to compress
    as the hand grows: cards overlap just enough to always fit. */
+function handDisplayOrder() {
+  /* Display-only ordering: the server's hand order is untouched, so a card is
+     still identified by id when it is played. Sorting colour-first then value
+     is what every physical player does to their own hand, and it makes the
+     playable card obvious without reading nine ovals. */
+  if (localStorage.getItem('uno_pref_sort') !== '1') return myCards.slice();
+  const colourRank = { red: 0, yellow: 1, green: 2, blue: 3, black: 4 };
+  const valueRank = v => {
+    if (/^\d+$/.test(v)) return Number(v);
+    return { skip: 10, reverse: 11, draw2: 12, wild: 13, wild4: 14 }[v] ?? 20;
+  };
+  return myCards.slice().sort((a, b) => {
+    const c = (colourRank[a.color] ?? 9) - (colourRank[b.color] ?? 9);
+    return c !== 0 ? c : valueRank(a.value) - valueRank(b.value);
+  });
+}
+
 function layoutMyHandOverlap() {
   const cards = myHandCardsContainer.children;
   if (!myHandPanel || !cards.length) return;
@@ -1400,16 +1543,41 @@ function renderMyHand() {
   myHandCountTag.textContent = `${myCards.length} CARD${myCards.length === 1 ? '' : 'S'}`;
 
   const isMyTurn = !!(currentGameState && currentGameState.started && currentGameState.turn_seat === mySeat);
+  /* A Draw Four awaiting an answer parks the turn: nothing in hand is playable
+     until the victim decides, so highlighting a "playable" card there would be
+     a lie the server then rejects. */
+  const parked = !!(currentGameState && currentGameState.pending_wild4);
   myHandCardsContainer.classList.toggle('idle', !isMyTurn);
   myHandCardsContainer.innerHTML = '';
 
   const newIds = new Set(myCards.map(c => c.id));
 
-  myCards.forEach((card, idx) => {
-    const playable = isMyTurn && isCardPlayable(card) && canPlayCard(card);
+  handDisplayOrder().forEach((card, idx) => {
+    const playable = isMyTurn && !parked && isCardPlayable(card) && canPlayCard(card);
     const cardEl = document.createElement('div');
     cardEl.className = 'uno-card card-' + card.color + (isMyTurn ? (playable ? ' playable' : ' not-playable') : '');
     cardEl.innerHTML = getCardInnerMarkup(card);
+    cardEl.dataset.cardId = card.id;
+    /* Cards are reachable by keyboard and announced by screen readers, which
+       a bare div was not: the whole hand was one opaque blob to assistive
+       tech. The label states the card and, when it matters, whether it can be
+       played right now. */
+    const sym = formatCardSymbol(card.value);
+    cardEl.tabIndex = playable ? 0 : -1;
+    cardEl.setAttribute('role', 'button');
+    cardEl.setAttribute('aria-label',
+      `${card.color} ${sym}${playable ? ' — playable' : ''}`);
+    if (playable) {
+      cardEl.setAttribute('aria-disabled', 'false');
+      cardEl.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onCardClicked(card, cardEl);
+        }
+      });
+    } else {
+      cardEl.setAttribute('aria-disabled', 'true');
+    }
 
     if (!lastHandIds.has(card.id)) {
       cardEl.classList.add('draw-in');
@@ -1448,13 +1616,6 @@ function appendMyCard() {
   layoutMyHandOverlap();
 }
 
-function applyFanPitch(fan) {
-  const n = fan.childElementCount;
-  if (n > 1) {
-    fan.style.setProperty('--fan-pitch', Math.min(FAN_PITCH, (FAN_MAX_W - 44) / (n - 1)) + 'px');
-  }
-}
-
 function appendOpponentBack(pod) {
   const tray = pod.querySelector('.opp-card-tray');
   if (!tray) return;
@@ -1469,7 +1630,18 @@ function appendOpponentBack(pod) {
   back.className = 'card-back';
   back.innerHTML = '<div class="back-oval"><span class="back-uno">UNO</span></div>';
   fan.appendChild(back);
-  applyFanPitch(fan);
+  /* Re-fan on every card, so the arch is already correct as the deal lands
+     rather than snapping at the end. */
+  layoutOpponentFan(fan);
+
+  /* The count label climbs with the deal. */
+  const label = pod.querySelector('.opp-hand-count');
+  if (label) {
+    const n = fan.childElementCount;
+    label.hidden = false;
+    label.textContent = n === 1 ? 'UNO!' : `${n} CARD${n === 1 ? '' : 'S'}`;
+    label.classList.toggle('uno-alert', n === 1);
+  }
 }
 
 /* ==========================================================================
@@ -1576,10 +1748,10 @@ function startDeal(state) {
     if (key === 'me') {
       appendMyCard();
     } else {
+      /* appendOpponentBack() fans the cards and climbs that seat's own count
+         label; there is no centre pill to keep in step any more. */
       const pod = opponentPod(key);
       if (pod) appendOpponentBack(pod);
-      const el = centreSeatEls[key];
-      if (el) el.querySelector('.cs-count').textContent = String(dealRevealed[key]);
     }
     if (dealt >= expected) finishDeal();
   });
@@ -1734,10 +1906,25 @@ if (btnCallUnoCtrl) btnCallUnoCtrl.onclick = callUnoAction;
 
 btnStartGame.onclick = () => sendServerMessage({ type: 'start' });
 
+/* The two answers to a Wild Draw Four. Accepting is the safe line: you draw
+   the four and play moves on. Challenging only pays when the player who laid
+   it was bluffing, and costs six cards when they were not - which is the whole
+   point of the official rule, so the labels say so. */
+btnChallenge.onclick = () => {
+  modalChallenge.classList.remove('active');
+  sendServerMessage({ type: 'challenge_wild4', accept: false });
+};
+btnAcceptDraw.onclick = () => {
+  modalChallenge.classList.remove('active');
+  sendServerMessage({ type: 'challenge_wild4', accept: true });
+};
+
 btnPlayAgain.onclick = () => {
   modalGameOver.classList.remove('active');
   /* "Continue Playing" keeps everyone seated and the scores running, which
-     is the whole point of a same-room rematch. */
+     is the whole point of a same-room rematch. When the match is over the
+     server clears the scores first, so this starts a fresh match rather than
+     continuing one that has already been decided. */
   sendServerMessage({ type: 'start' });
 };
 
@@ -1858,13 +2045,34 @@ function setupMyCameraFeedIfAvailable() {
 
 function handleGameOver(msg) {
   const won = msg.winner_seat === mySeat;
-  if (won) sfx.victory();
-  gameOverTrophy.textContent = won ? '🏆' : '👏';
-  gameOverTitle.textContent = won ? 'You Won!' : `${msg.winner_name} Wins!`;
+  const matchWon = !!msg.match_over && msg.match_winner_seat === mySeat;
+  if (matchWon || won) sfx.victory();
+  gameOverTrophy.textContent = matchWon ? '🏆' : won ? '🎉' : '👏';
+
+  /* A round win is not a match win under the official 500-point target, so
+     the title has to distinguish the two. Everything else about the modal is
+     the same, because the scores and the all-time table are what people look
+     at either way. */
+  if (msg.match_over) {
+    gameOverTitle.textContent = matchWon
+      ? 'You won the match!'
+      : `${msg.winner_name || 'Someone'} won the match`;
+  } else if (msg.match_target) {
+    gameOverTitle.textContent = won
+      ? 'You won the round!'
+      : `${msg.winner_name} wins the round`;
+  } else {
+    gameOverTitle.textContent = won ? 'You Won!' : `${msg.winner_name} Wins!`;
+  }
+
   const roundLabel = msg.round_number ? `Round ${msg.round_number}` : 'Round';
-  gameOverMsg.textContent = msg.points_mode === 'wins'
-    ? `${roundLabel} complete — flat win bonus awarded.`
-    : `${roundLabel} complete — points taken from cards left in opponents' hands.`;
+  if (msg.points_mode === 'wins') {
+    gameOverMsg.textContent = `${roundLabel} complete — flat win bonus awarded.`;
+  } else if (msg.match_over) {
+    gameOverMsg.textContent = `${roundLabel} complete — match won at ${msg.match_target} points.`;
+  } else {
+    gameOverMsg.textContent = `${roundLabel} complete — points taken from cards left in opponents' hands. First to ${msg.match_target} wins the match.`;
+  }
 
   /* Lifetime standings travel with the game-over payload so the all-time tab
      is populated without a second round trip. */
@@ -1922,6 +2130,20 @@ function setupMyCameraFeed() {
   const el = $(id);
   if (el) el.addEventListener('change', pushSettings);
 });
+
+/* Hand sorting is a personal display preference, not a table rule: it changes
+   nothing the server knows about and nothing anyone else sees, so it lives in
+   localStorage rather than in the room settings. */
+const setSortHand = $('setSortHand');
+if (setSortHand) {
+  setSortHand.checked = localStorage.getItem('uno_pref_sort') === '1';
+  setSortHand.addEventListener('change', () => {
+    localStorage.setItem('uno_pref_sort', setSortHand.checked ? '1' : '0');
+    /* Re-render from the same state: the order is applied at render time, so
+       nothing has to be re-fetched. */
+    if (currentGameState) renderMyHand();
+  });
+}
 
 if ($('btnShuffleSeats')) {
   $('btnShuffleSeats').onclick = () => {
@@ -2792,20 +3014,89 @@ inputCode.addEventListener('keydown', e => { if (e.key === 'Enter') btnJoinWithC
 checkCamera.addEventListener('change', () => localStorage.setItem('uno_pref_cam', checkCamera.checked ? '1' : '0'));
 checkMic.addEventListener('change', () => localStorage.setItem('uno_pref_mic', checkMic.checked ? '1' : '0'));
 
+/* The seat that follows `fromSeat` in `direction`, or null if the table is too
+   small to tell. Used to spot a Skip: a turn that jumped further than one seat
+   when nobody drew a penalty. */
+function nextSeatAfter(state, fromSeat, direction) {
+  const order = Object.keys((state && state.seats) || {}).map(Number).sort((a, b) => a - b);
+  const index = order.indexOf(fromSeat);
+  if (index < 0 || order.length < 2) return null;
+  return order[(index + direction + order.length) % order.length];
+}
+
+/* Tells the table what just happened.
+
+   The card animations show a card moving, but not what it DID: a Skip looks
+   exactly like a number card landing until you notice whose turn it is now.
+   Diffing the previous state against the new one recovers the missing story -
+   a direction flip, a player who lost their turn, a hand that jumped by a
+   penalty - and states it, without the server having to send an event. */
+function actionFeedback(prev, next) {
+  if (!prev || !next || !next.started) return;
+  if (prev.started && !next.started) return;         // round over, not an action
+  if (dealInProgress) return;
+
+  /* Direction flipped. The arrows and the ring already mirror, but the change
+     is easy to miss mid-turn, so say it. */
+  if (prev.direction !== next.direction) {
+    showToast(next.direction === 1
+      ? '🔄 Direction reversed — clockwise'
+      : '🔄 Direction reversed — anticlockwise');
+    if (directionArrow) {
+      directionArrow.classList.remove('direction-pop');
+      void directionArrow.offsetWidth;
+      directionArrow.classList.add('direction-pop');
+    }
+  }
+
+  /* A hand that jumped by 2 or 4 is a draw penalty. */
+  let penalised = 0;
+  Object.keys(next.seats || {}).forEach(seatStr => {
+    const before = prev.seats && prev.seats[seatStr] ? prev.seats[seatStr].hand_count : null;
+    const after = next.seats[seatStr].hand_count;
+    if (before == null || after == null) return;
+    const gained = after - before;
+    if (gained !== 2 && gained !== 4) return;
+    penalised++;
+    const name = next.seats[seatStr].name || `Seat ${seatStr}`;
+    showToast(gained === 4 ? `💥 ${name} draws 4` : `💥 ${name} draws 2`);
+  });
+
+  /* A Skip is the only thing that moves the turn PAST its natural next seat
+     without anyone drawing for it - so both conditions are required. Without
+     them every ordinary play would be reported as a skip, and a player
+     leaving mid-round would too. */
+  const seatCountSame = Object.keys(prev.seats || {}).length === Object.keys(next.seats || {}).length;
+  if (seatCountSame && penalised === 0 && prev.turn_seat != null && next.turn_seat != null) {
+    const expected = nextSeatAfter(next, prev.turn_seat, next.direction);
+    if (expected != null && next.turn_seat !== expected) {
+      const name = (next.seats[String(expected)] || {}).name || `Seat ${expected}`;
+      showToast(`⏭ ${name} was skipped`);
+    }
+  }
+}
+
 /* --------------------------------------------------------------------------
    Play-direction arrowhead
    --------------------------------------------------------------------------
 
-The head is a triangle that rides the rounded rectangular track around the two
-decks, drawn so its BASE straddles the stroke and its tip leads along the path.
-Its position and facing are written to the `transform` attribute each frame.
+The loop is one arrow: a triangular head with a dash body trailing behind it.
+Both are driven from a SINGLE progress value, so they can never drift apart.
 
-Geometrically: the polygon is defined with the middle of its base at the local
-origin, so the transform places that point exactly on the track's centreline.
-The triangle then extends half its length ahead of the line and half behind,
-which is what makes it read as part of the stroke rather than a blob parked
-next to it. An earlier version put the TIP at the origin instead, so the whole
-body stuck out past the ring and only the tip touched the line.
+The head is a triangle whose BASE MIDPOINT sits at the local origin and whose
+tip leads 14 units along +x, so +x is the direction of travel. Writing
+`translate(x y) rotate(heading)` puts that base midpoint on the track's
+centreline with the tip pointing the way play moves, which is what makes the
+shape read as part of the stroke rather than a blob parked next to it. An even
+earlier version put the TIP at the origin, so the whole body stuck out past the
+ring and only the tip touched the line.
+
+The body is the same rounded rectangle drawn with a dash. Its leading edge is
+placed exactly under the head's base (`progress`), so the two ends meet and the
+head covers the joint - one continuous arrow, no seam and no doubled stroke.
+
+     head:  (progress)                      -> base sits ON the leading edge
+     body:  dashoffset = 100 - progress*100 -> leading edge falls on `progress`
 
 The `transform` attribute is set directly rather than left to CSS or SMIL,
 because both of those were tried and both draw the shape wrong on an SVG child:
@@ -2841,6 +3132,10 @@ const LOOP_HEAD_SEGMENTS = (() => {
 })();
 
 const LOOP_HEAD_LAP_MS = 5000;
+const LOOP_BODY_DASH = 12;   /* length of the trailing dash, in lap percent
+                                (pathLength="100", so the gap is 100 - this).
+                                A third of the bottom edge reads as a comet
+                                tail; a longer one turns into a solid slab. */
 
 function placeLoopHead(head, progress) {
   /* Walk the segments until the travelled share is used up, then interpolate
@@ -2867,6 +3162,35 @@ function placeLoopHead(head, progress) {
   }
 }
 
+/* One lap, drawn once: head placement and body dash from the same `progress`. */
+function drawLoop(progress) {
+  const wrap = document.querySelector('#pileLoop');
+  if (!wrap) return;
+  const head = wrap.querySelector('.pile-loop-head');
+  const arc = wrap.querySelector('.pile-loop-arc');
+
+  placeLoopHead(head, progress);
+
+  /* The body's LEADING edge must land exactly on the head's base, so the head
+     covers the joint and the two read as one arrow.
+
+     A positive stroke-dashoffset shifts the dash pattern BACKWARDS along the
+     path, so the dash that would begin at position 0 begins at -offset. The
+     dash spans [start, start + dash], and its leading edge is the far end of
+     that span. Setting the leading edge to the head's position P therefore
+     needs start = P - dash, i.e. offset = dash - P (in lap percent).
+
+     The dash pattern's period must be exactly the 100 that pathLength declares,
+     or the pattern does not repeat once per lap and the offset stops meaning
+     "this position on the loop". Hence the gap is 100 - dash, not any value
+     that merely looks right. */
+  if (arc) {
+    arc.style.strokeDasharray = `${LOOP_BODY_DASH} ${100 - LOOP_BODY_DASH}`;
+    const offset = (LOOP_BODY_DASH - progress * 100) % 100;
+    arc.style.strokeDashoffset = String(offset < 0 ? offset + 100 : offset);
+  }
+}
+
 let loopHeadRaf = null;
 
 function driveLoopHead() {
@@ -2874,17 +3198,17 @@ function driveLoopHead() {
   if (!head) return;
 
   /* Respect a reduced-motion preference by parking the head part-way along the
-     top edge: the direction is still legible from its facing, but nothing
-     moves. */
+     top edge and hiding the body: the direction is still legible from the
+     head's facing, but nothing moves. */
   if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-    placeLoopHead(head, 0.14);
+    drawLoop(0.14);
     return;
   }
 
   if (loopHeadRaf !== null) cancelAnimationFrame(loopHeadRaf);
   const started = performance.now();
   const tick = (now) => {
-    placeLoopHead(head, ((now - started) % LOOP_HEAD_LAP_MS) / LOOP_HEAD_LAP_MS);
+    drawLoop(((now - started) % LOOP_HEAD_LAP_MS) / LOOP_HEAD_LAP_MS);
     loopHeadRaf = requestAnimationFrame(tick);
   };
   loopHeadRaf = requestAnimationFrame(tick);

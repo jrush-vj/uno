@@ -47,7 +47,10 @@
      in pixels from the measured heights of the bands so they come out even;
      this is the smallest gap it will settle for, and the gap the centre
      cluster falls back to before the first measurement lands. */
-  --gap-unit: max(14px, calc(var(--u) * 24));
+  /* Only ever read as the centre cluster's stand-in `top` before layoutTable()
+     has taken its first measurement, so it just needs to keep the banner clear
+     of the top bar at every size. */
+  --gap-unit: max(20px, calc(var(--u) * 30));
 
   /* Legacy Figma tile origins, used only by the `.slot-*` labels. My own tile
      is marked by .slot-me but positioned in pixels by layoutTable(); the
@@ -926,7 +929,11 @@ input { font-family: inherit; }
 }
 .camera-box video.live { opacity: 1; }
 
-/* name — Figma "Player 1": JetBrains Mono Bold 20px @ 15,143.95 of the tile */
+/* name — Figma "Player 1": JetBrains Mono Bold 20px @ 15,143.95 of the tile.
+   This and the score share one strip at top 79.97%, so the name must stop
+   short of where the score begins; at a flat 90% a long name ran under the
+   score and the ellipsis appeared to swallow it. The name gets what is left
+   after the score's own 5.556% inset and a gutter. */
 .cam-name-text {
   position: absolute;
   left: 5.556%;
@@ -939,7 +946,7 @@ input { font-family: inherit; }
   white-space: nowrap;
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
   z-index: 3;
-  max-width: 90%;
+  max-width: 66%;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -999,22 +1006,35 @@ input { font-family: inherit; }
 .player-pod.empty .cam-name-text { color: rgba(255, 255, 255, 0.45); text-shadow: none; }
 
 /* --------------------------------------------------------------------------
-   OPPONENT CARD FAN — sits flush under each opponent tile.
-   Figma: 3 backs of 44x66 on a 40px pitch, centred on the tile.
-   -------------------------------------------------------------------------- */
+   OPPONENT CARD FAN — an arch of face-down cards hanging under each tile,
+   with the exact hand size printed beneath it.
+
+   The cards' angle and drop are computed per card in layoutOpponentFan()
+   (app.js) and written to `transform`. Everything here is the static shape:
+   the tray's box, the overlap step (a JS-set custom property), and the count
+   label. ------------------------------------------------------------------- */
 .opp-card-tray {
   display: flex;
   justify-content: center;
-  height: calc(var(--u) * 66);
-  margin-top: 0;
+  /* Real breathing room under the camera tile. This used to be 0, against a
+     fixed 66u height that exactly matched one card, so the backs sat flush
+     against the tile's border with no slack at all. */
+  margin-top: calc(var(--u) * 10);
+  /* The arch splays the tops past the row's own box, so the tray must not
+     clip. It is measured by layoutTable(), which is why it stays in flow. */
+  overflow: visible;
   pointer-events: none;
 }
-.opp-card-tray:empty { height: 0; }
+.opp-card-tray:empty { display: none; }
 
 .opp-card-fan {
   display: flex;
   align-items: flex-start;
-  height: calc(var(--u) * 66);
+  justify-content: center;
+  /* Tall enough for a card plus the arch's drop, so the tray reserves the
+     room before the cards land. */
+  height: calc(var(--u) * 78);
+  overflow: visible;
 }
 
 .card-back {
@@ -1030,9 +1050,50 @@ input { font-family: inherit; }
   justify-content: center;
   flex-shrink: 0;
   position: relative;
+  /* A hand fan pivots at the BOTTOM of each card, so the bottoms stay in a
+     row while the tops splay. */
+  transform-origin: bottom center;
+  /* The pop animates `scale` and `opacity`, NOT `transform`: `transform`
+     carries the arch angle, and a keyframe that set it would flatten the
+     whole fan back into a row for the length of the animation. */
   animation: backPop 0.34s cubic-bezier(0.34, 1.56, 0.64, 1) backwards;
 }
-.card-back + .card-back { margin-left: calc(var(--fan-pitch, calc(var(--u) * 40)) - var(--bw)); }
+/* Step between cards, set by layoutOpponentFan() so the row always fits the
+   tile. This used to mix a raw px value from JS with a u-scaled card width,
+   which turned the overlap into a gap on a narrow window and overflowed the
+   tile by ~2.5x. */
+.card-back + .card-back { margin-left: var(--fan-step, calc(var(--bw) * -0.34)); }
+
+/* The tail of a hand bigger than the fan draws: "+3" carries the remainder so
+   the shape of the fan still differs between a 10-card and a 14-card hand. */
+.card-back.more {
+  background: #1b1b22;
+  font-family: var(--font-mono);
+  font-weight: 800;
+  font-size: calc(var(--bw) * 0.34);
+  color: var(--accent);
+  letter-spacing: -0.02em;
+}
+
+/* The exact hand size, under the fan. */
+.opp-hand-count {
+  display: block;
+  margin-top: calc(var(--u) * 4);
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: max(10px, calc(var(--u) * 13));
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+}
+.opp-hand-count[hidden] { display: none; }
+/* One card and it was never declared: flag it the same way the centre chip
+   does, so the table can see who is catchable without hunting for the chip. */
+.opp-hand-count.uno-alert {
+  color: var(--uno-red);
+  animation: unoPulse 1.25s ease-in-out infinite;
+}
 
 .card-back .back-oval {
   width: 62%;
@@ -1055,8 +1116,10 @@ input { font-family: inherit; }
 }
 
 @keyframes backPop {
-  from { opacity: 0; transform: translateY(-12px) scale(0.7); }
-  to   { opacity: 1; transform: translateY(0) scale(1); }
+  /* `scale` rather than `transform`, so the pop does not fight the arch angle
+     that layoutOpponentFan() writes to `transform`. */
+  from { opacity: 0; scale: 0.7; }
+  to   { opacity: 1; scale: 1; }
 }
 
 /* ==========================================================================
@@ -1078,14 +1141,19 @@ input { font-family: inherit; }
   max-width: 96vw;
 }
 
-/* ---- turn banner: 50 tall, centred at x 960 --------------------------- */
+/* ---- turn banner: centred at x 960 --------------------------- */
 .table-turn-banner {
   display: inline-flex;
   align-items: center;
   gap: calc(var(--u) * 14);
   max-width: 100%;
-  height: calc(var(--u) * 50);
-  padding: 0 calc(var(--u) * 26);
+  /* The height has a real pixel floor and a min-height, not just a u-scaled
+     value: the orbs inside it stop shrinking at their own max() floors, so at
+     a small window a purely u-scaled height left the contents overflowing the
+     pill and crowding each other. */
+  height: auto;
+  min-height: max(38px, calc(var(--u) * 54));
+  padding: calc(var(--u) * 8) calc(var(--u) * 28);
   border-radius: 999px;
   background: rgba(8, 8, 8, 0.94);
   border: max(1px, calc(var(--u) * 1.5)) solid rgba(255, 255, 255, 0.16);
@@ -1159,11 +1227,11 @@ input { font-family: inherit; }
   justify-content: center;
   gap: calc(var(--u) * 47);
   /* The ring's arc curves above and below the cards, and this margin is what
-     it curves into. It was 14u, which left the arc only 2px from the turn
-     banner at smaller windows - the cards have a minimum width and stop
-     shrinking before the banner does, so that gap closes as the viewport
-     narrows and the ring would start to crowd it. */
-  margin-top: calc(var(--u) * 26);
+     it curves into. It was 14u, then 26u, and both left the arc's top edge
+     level with or above the turn banner at smaller windows - the cards have a
+     minimum width and stop shrinking before the banner does, so that gap
+     closes as the viewport narrows and the ring starts to crowd the pill. */
+  margin-top: calc(var(--u) * 52);
 }
 
 /* ---- play-direction ring, wrapped around both piles.
@@ -1179,7 +1247,13 @@ input { font-family: inherit; }
      behind them, so only the corners showed.
 
      Width and height are symmetric about the pile group, so the ring is
-     concentric with the two decks rather than offset toward one of them. */
+     concentric with the two decks rather than offset toward one of them.
+
+     The clearance expression is deliberately the SAME on both axes (one
+     percentage of the card width added to each side). An earlier version used
+     0.60 for width and 0.30 for height, which is only equivalent before the
+     viewBox padding factors are applied; once they are, the vertical gap came
+     out 2.3x the horizontal one and the ring was visibly not concentric. */
 .pile-loop {
   position: absolute;
   left: 50%;
@@ -1187,22 +1261,28 @@ input { font-family: inherit; }
   /* Centring lives in the `translate` property rather than `transform`, so the
      reverse mirror below can use `transform` without fighting it. */
   translate: -50% -50%;
-  /* Clearance is real pixels of felt, on top of the card group's own box, and
-     an equal amount on each opposite pair so the ring stays concentric with the
-     two decks.
+  /* The CSS box is the TRACK (the cards plus one clearance on every side) grown
+     by the viewBox's own padding, so the drawn track - not the viewBox edge -
+     lands at the requested distance from the cards.
 
-     The viewBox is 340x190 with the track a 320x170 rect inset 10 units inside
-     it, so the box below is `track + clearance` scaled by 340/320 and 190/170.
-     Those two factors are what make the drawn track - not the viewBox edge -
-     land the requested distance from the cards. Applying them per axis matters:
-     under preserveAspectRatio="none" the axes scale independently, so a single
-     shared factor would leave the ring off-centre.
+     The viewBox is 340x190 around a 320x170 track: 10 units of margin on each
+     side of both axes. Under preserveAspectRatio="xMidYMid meet" the drawing
+     letterboxes unless the box has the viewBox's own 340:190 ratio, and a
+     letterboxed ring no longer sits concentrically on the cards. So the height
+     is DERIVED from the width with aspect-ratio rather than computed from its
+     own expression: a `100%` inside `height` resolves against the parent's
+     HEIGHT, while the same token inside `width` resolves against its WIDTH, so
+     two independent calc()s can never agree on one ratio.
 
-     0.60 / 0.30 of a card clears the card's 2px border and its 4px offset
-     box-shadow with felt to spare, which is what makes the ring read as
-     wrapping the decks instead of clipping their corners. */
-  width: calc((100% + var(--pile-w) * 0.60) * 340 / 320);
-  height: calc((100% + var(--pile-w) * 0.30) * 190 / 170);
+     --pile-w * 0.8 is four fifths of a card of felt beyond each edge: enough to
+     clear the card's 2px border and its 4px offset box-shadow, and to read as
+     wrapping the decks. It is deliberately not larger - every unit of
+     clearance grows the ring's box by ~0.5 unit on each side, and that
+     overhang is what was eating the gaps between the ring and the turn banner
+     above it and the hand below it. */
+  width: calc((100% + var(--pile-w) * 0.8) * 340 / 320);
+  height: auto;
+  aspect-ratio: 340 / 190;
   --loop-color: #ffffff;
   pointer-events: none;
   /* Above the cards: the ring is a frame around the decks, so it reads as
@@ -1250,9 +1330,10 @@ input { font-family: inherit; }
   stroke: currentColor;
 }
 
-/* The head is a filled shape whose TIP sits at its local origin. Its position
-   and facing are written to the transform attribute every frame by driveLoopHead
-   in app.js, so no transform or animation property belongs here.
+/* The head is a filled shape whose BASE MIDPOINT sits at its local origin.
+   Its position and facing are written to the transform attribute every frame
+   by driveLoopHead in app.js, so no transform or animation property belongs
+   here.
 
    Declarative motion was tried first and both routes drew the shape wrong on an
    SVG child: a CSS transform pivots about the viewBox origin instead of the
@@ -1268,35 +1349,32 @@ input { font-family: inherit; }
   filter: drop-shadow(0 0 8px currentColor);
 }
 
-/* A dash travelling along the rectangular track.
+/* The travelling BODY of the arrow: a dash that trails the head.
 
-   The arc is the full outline (pathLength=100) and the dash is one travelling
-   segment of it, but it must be EMPTY everywhere the arrowhead sits or the
-   quiet stroke and the head fight over the same spot. The head occupies about
-   x=173..193 of the 340-wide top edge, so the gap is pinned to the top edge:
-   from 51% to 57.5% of the perimeter, with the travelling dash in the rest.
+   This used to be a CSS animation with a hand-tuned gap so the dash did not
+   overlap the head, running on its own independent 5 s timeline. Two
+   free-running timelines drift apart the first time one restarts (a re-render,
+   a direction flip, a tab waking up), and the head then sits on a bare track
+   with the body somewhere else entirely - the detached arrow this fixes.
 
-   stroke-dashoffset animates by exactly one full perimeter (-100), so the dash
-   loops seamlessly: it leaves the top edge, goes all the way round, and returns
-   to the identical starting offset. ------------------------------------- */
+   Both are now driven from ONE progress number in app.js:
+     stroke-dashoffset  puts the body's leading edge exactly under the head's
+                        base. The head has covered that point, so the two ends
+                        meet edge to edge with no seam and no overlap.
+     stroke-dasharray   makes the body a fixed-length segment of the loop.
+   pathLength="100" on the element is what lets both be expressed as a
+   percentage of one lap, whatever the ring's real size. */
 .pile-loop-arc {
   stroke: currentColor;
-  stroke-dasharray: 14 86;
-  animation: pileFlow 5s linear infinite;
+  stroke-dasharray: 18 90;
+  stroke-dashoffset: 0;
 }
 
-@keyframes pileFlow {
-  from { stroke-dashoffset: 0; }
-  to   { stroke-dashoffset: -100; }
-}
-
-/* Motion is decoration: the direction is also stated in the banner, so stopping
-   the travel loses nothing. SMIL cannot be paused from CSS, so the animation is
-   disabled through the SVG's own timeline via the SVGAnimationElement API in
-   the script if that is ever needed; here the head is simply left to rest at
-   its first keyframe, on the top edge. */
+/* Motion is decoration: the direction is also stated in the banner and in the
+   head's own facing, so stopping the travel loses nothing. The dash is hidden
+   entirely and the head is left parked part-way along the top edge. */
 @media (prefers-reduced-motion: reduce) {
-  .pile-loop-arc { animation: none; stroke-dasharray: none; opacity: 0; }
+  .pile-loop-arc { stroke-dasharray: none; stroke-dashoffset: 0; opacity: 0; }
 }
 
 .draw-deck-3d {
@@ -1380,9 +1458,16 @@ input { font-family: inherit; }
   border: 1px dashed rgba(255, 255, 255, 0.18);
 }
 
-/* Seat counts, one pill per opponent, in seat order. A flow child of the
-   centre cluster so its height counts towards the cluster's — see the note on
-   .btn-start-game. */
+/* UNO alerts, one pill per seat that is catchable, in seat order. A flow child
+   of the centre cluster so its height counts towards the cluster's — see the
+   note on .btn-start-game.
+
+   This row used to list every player's hand size. That duplicated the count
+   now printed under each opponent's own cards - a number under the seat it
+   describes beats the same number in a row in the middle of the table, and
+   dropping it takes a whole band out of the most crowded part of the layout.
+   What is left is the part that is genuinely actionable: who is sitting on one
+   card without having called UNO, and the button that catches them. */
 .centre-seats {
   position: relative;
   margin-top: calc(var(--u) * 12);
@@ -1502,9 +1587,12 @@ input { font-family: inherit; }
   display: flex;
   flex-direction: column;
   align-items: center;
-  /* The header floats above the cards, so this leaves the cards just clear of
-     whatever the cluster holds above them. */
-  margin-top: calc(var(--u) * 44);
+  /* The header floats ABOVE the cards (bottom:100%), so this margin is the
+     only thing keeping that header clear of the direction ring overhead. At
+     44u the header's top edge landed inside the ring's box, and the arrowhead
+     sweeps a further ~8px below the drawn track at the corners, so the two
+     could touch. 68u clears the ring's full box plus the head's sweep. */
+  margin-top: calc(var(--u) * 68);
   min-width: 0;
 }
 
