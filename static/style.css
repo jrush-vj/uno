@@ -1250,23 +1250,15 @@ input { font-family: inherit; }
   stroke: currentColor;
 }
 
-/* The head is a filled shape that travels the rectangular track.
+/* The head is a filled shape whose TIP sits at its local origin. Its position
+   and facing are written to the transform attribute every frame by driveLoopHead
+   in app.js, so no transform or animation property belongs here.
 
-   It is animated with an explicit translate() + rotate() per keyframe rather
-   than with CSS offset-path. offset-path is a transform feature for HTML
-   boxes: on an SVG child Chrome does not position it along the path, and
-   offset-distance resolves against the element's own box instead of the path.
-   The head sat effectively still and never turned with the corners.
+   Declarative motion was tried first and both routes drew the shape wrong on an
+   SVG child: a CSS transform pivots about the viewBox origin instead of the
+   shape's own, and SMIL rendered nothing at all. See app.js for the detail.
 
-   The keyframes below walk the track exactly. The track is a 320x170 rect at
-   (10,10) with r=24, so its straights are 272 across and 122 down and its
-   perimeter is 2*272 + 2*122 + 2*pi*24 = 938.8 units. Each keyframe places the
-   head's rotation origin - the middle of its base - on that outline.
-
-   transform-origin is the base of the triangle, not its centre, so the head
-   pivots about the point where it meets the line and the tip always leads the
-   base. A head rotated about its centre swings its base backwards on every
-   corner, which reads as the arrow trailing the path. ------------------- */
+   Only paint properties are set here. */
 .pile-loop-head {
   fill: currentColor;
   stroke: currentColor;
@@ -1274,27 +1266,6 @@ input { font-family: inherit; }
   stroke-linejoin: round;
   opacity: 0.95;
   filter: drop-shadow(0 0 8px currentColor);
-  transform-box: view-box;
-  transform-origin: 0px 0px;
-  animation: pileHead 5s linear infinite;
-}
-
-/* One full lap, clockwise. 0deg points along +x, which is the direction of play
-   across the top edge. The percentage stops are the cumulative distance around
-   the 938.8-unit perimeter, so the head holds a constant speed through the
-   straights and the quarter-circle corners alike. */
-@keyframes pileHead {
-  0%     { transform: translate(34px, 10px)   rotate(0deg); }
-  14.49% { transform: translate(170px, 10px)  rotate(0deg); }
-  29.0%  { transform: translate(306px, 10px)  rotate(0deg); }
-  33.0%  { transform: translate(330px, 34px)  rotate(90deg); }
-  46.0%  { transform: translate(330px, 156px) rotate(90deg); }
-  50.0%  { transform: translate(306px, 180px) rotate(180deg); }
-  64.5%  { transform: translate(170px, 180px) rotate(180deg); }
-  79.0%  { transform: translate(34px, 180px)  rotate(180deg); }
-  83.0%  { transform: translate(10px, 156px)  rotate(270deg); }
-  96.0%  { transform: translate(10px, 34px)   rotate(270deg); }
-  100%   { transform: translate(34px, 10px)   rotate(360deg); }
 }
 
 /* A dash travelling along the rectangular track.
@@ -1319,15 +1290,13 @@ input { font-family: inherit; }
   to   { stroke-dashoffset: -100; }
 }
 
-/* Motion is decoration: the direction is also stated in the banner, so
-   stopping the travel loses nothing. The head is parked mid-way along the top
-   edge so the ring still reads as directional when motion is off. */
+/* Motion is decoration: the direction is also stated in the banner, so stopping
+   the travel loses nothing. SMIL cannot be paused from CSS, so the animation is
+   disabled through the SVG's own timeline via the SVGAnimationElement API in
+   the script if that is ever needed; here the head is simply left to rest at
+   its first keyframe, on the top edge. */
 @media (prefers-reduced-motion: reduce) {
   .pile-loop-arc { animation: none; stroke-dasharray: none; opacity: 0; }
-  .pile-loop-head {
-    animation: none;
-    transform: translate(170px, 10px) rotate(0deg);
-  }
 }
 
 .draw-deck-3d {

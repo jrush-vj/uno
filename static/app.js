@@ -2742,6 +2742,11 @@ async function startSession(room, name, camPref, micPref) {
   try { sfx.init(); } catch(e) {}
   ensureAudioContext();
 
+  /* The direction ring is part of the table, so its arrowhead starts moving as
+     the table opens rather than on the deal: it shows which way play will run
+     even while the other seats are still filling. */
+  driveLoopHead();
+
   /* Join first, then bring the camera and microphone up.
 
      Entering the table used to wait on getUserMedia - a device query that
@@ -2786,6 +2791,97 @@ inputName.addEventListener('keydown', e => { if (e.key === 'Enter') btnCreateGam
 inputCode.addEventListener('keydown', e => { if (e.key === 'Enter') btnJoinWithCode.click(); });
 checkCamera.addEventListener('change', () => localStorage.setItem('uno_pref_cam', checkCamera.checked ? '1' : '0'));
 checkMic.addEventListener('change', () => localStorage.setItem('uno_pref_mic', checkMic.checked ? '1' : '0'));
+
+/* --------------------------------------------------------------------------
+   Play-direction arrowhead
+   --------------------------------------------------------------------------
+
+The head is a triangle whose tip sits at its own origin, riding the rounded
+rectangular track around the two decks. Its position and facing are written to
+the `transform` attribute each frame.
+
+That attribute is set directly rather than left to CSS or SMIL, because both
+of those were tried and both draw the shape wrong on an SVG child:
+
+  - A CSS transform resolves transform-origin against the viewBox, so rotate()
+    turned the head about the viewBox corner instead of its own tip. It left
+    the stroke and pointed backwards along the bottom edge.
+  - The SMIL animateTransform version rendered nothing at all: the transform
+    attribute stayed null and the shape kept a zero-sized box.
+
+The path is a rounded rectangle inside a 340x190 viewBox, so all the geometry
+below is plain arithmetic in that space. */
+const LOOP_HEAD_SEGMENTS = (() => {
+  const left = 10, top = 10, right = 330, bottom = 180, radius = 24;
+  const across = (right - left) - radius * 2;
+  const down = (bottom - top) - radius * 2;
+  const corner = (Math.PI * radius) / 2;
+  const total = across * 2 + down * 2 + corner * 4;
+
+  /* One entry per straight and per corner, in the order a clockwise lap meets
+     them, each with the point it starts at and the heading it travels in.
+     Headings are degrees clockwise from +x, matching SVG's y-down axes. */
+  return [
+    { len: across, x: left + radius,  y: top,             heading: 0 },
+    { len: corner, arc: { cx: right - radius, cy: top + radius  }, heading: 0,   turn: 90 },
+    { len: down,   x: right,          y: top + radius,    heading: 90 },
+    { len: corner, arc: { cx: right - radius, cy: bottom - radius }, heading: 90,  turn: 90 },
+    { len: across, x: right - radius, y: bottom,          heading: 180 },
+    { len: corner, arc: { cx: left + radius,  cy: bottom - radius }, heading: 180, turn: 90 },
+    { len: down,   x: left,           y: bottom - radius, heading: 270 },
+    { len: corner, arc: { cx: left + radius,  cy: top + radius  }, heading: 270, turn: 90 },
+  ].map(s => ({ ...s, share: s.len / total }));
+})();
+
+const LOOP_HEAD_LAP_MS = 5000;
+
+function placeLoopHead(head, progress) {
+  /* Walk the segments until the travelled share is used up, then interpolate
+     within the one it landed in. The head therefore holds a constant speed
+     through the straights and the corners alike. */
+  let travelled = progress;
+  for (const seg of LOOP_HEAD_SEGMENTS) {
+    if (travelled > seg.share) { travelled -= seg.share; continue; }
+    const t = seg.share ? travelled / seg.share : 0;
+
+    if (seg.arc) {
+      const angle = (seg.heading + seg.turn * t - 90) * (Math.PI / 180);
+      const x = seg.arc.cx + Math.cos(angle) * 24;
+      const y = seg.arc.cy + Math.sin(angle) * 24;
+      const heading = seg.heading + seg.turn * t;
+      head.setAttribute('transform', `translate(${x.toFixed(2)} ${y.toFixed(2)}) rotate(${heading.toFixed(2)})`);
+    } else {
+      const rad = (seg.heading * Math.PI) / 180;
+      const x = seg.x + Math.cos(rad) * seg.len * t;
+      const y = seg.y + Math.sin(rad) * seg.len * t;
+      head.setAttribute('transform', `translate(${x.toFixed(2)} ${y.toFixed(2)}) rotate(${seg.heading})`);
+    }
+    return;
+  }
+}
+
+let loopHeadRaf = null;
+
+function driveLoopHead() {
+  const head = document.querySelector('#pileLoop .pile-loop-head');
+  if (!head) return;
+
+  /* Respect a reduced-motion preference by parking the head part-way along the
+     top edge: the direction is still legible from its facing, but nothing
+     moves. */
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    placeLoopHead(head, 0.14);
+    return;
+  }
+
+  if (loopHeadRaf !== null) cancelAnimationFrame(loopHeadRaf);
+  const started = performance.now();
+  const tick = (now) => {
+    placeLoopHead(head, ((now - started) % LOOP_HEAD_LAP_MS) / LOOP_HEAD_LAP_MS);
+    loopHeadRaf = requestAnimationFrame(tick);
+  };
+  loopHeadRaf = requestAnimationFrame(tick);
+}
 
 function boot() {
   const savedName = localStorage.getItem('uno_player_name');

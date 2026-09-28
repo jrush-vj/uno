@@ -344,12 +344,26 @@
                  is expressed as a percentage of the outline. -->
             <rect class="pile-loop-track" x="10" y="10" width="320" height="170" rx="24" ry="24" />
             <rect class="pile-loop-arc" x="10" y="10" width="320" height="170" rx="24" ry="24" pathLength="100" />
-            <!-- Arrowhead. Its local origin is the midpoint of its base, which is
-                 the point the stylesheet rotates about, so the tip leads the base
-                 all the way round. The tip points along +x: 0deg is the direction
-                 of play across the top edge. -->
-            <polygon class="pile-loop-head"
-                     points="20,0 0,-9 0,9" />
+            <!-- Arrowhead. Its TIP is at the local origin and the body trails
+                 along -x, so placing the tip on the track and rotating the body
+                 to face the direction of travel is all it takes to keep the head
+                 attached and pointing forward.
+
+                 The motion is driven from JavaScript (see driveLoopHead in
+                 app.js), not from CSS keyframes and not from SMIL. Both of the
+                 declarative routes were tried and both failed on real geometry:
+
+                   - A CSS transform on an SVG child resolves transform-origin
+                     against the viewBox by default, so rotate() swung the shape
+                     about the viewBox corner instead of its own tip. The head
+                     left the stroke and pointed backwards on the bottom edge.
+                   - SMIL rendered nothing at all here: the transform attribute
+                     stayed null and the shape had a zero-sized box, so the head
+                     was effectively invisible.
+
+                 Setting the transform attribute directly has no origin to get
+                 wrong and is trivially inspectable in the DOM. -->
+            <polygon class="pile-loop-head" points="0,0 -20,-9 -20,9" />
           </svg>
         </span>
 
