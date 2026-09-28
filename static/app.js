@@ -1156,10 +1156,13 @@ function renderGameState(state) {
 
   /* The rectangular track around the piles states play direction and current color.
      When direction is 1 (clockwise): play flows top deck left-to-right, bottom right-to-left.
-     When direction is -1 (counter-clockwise): mirrored, so arrow points opposite way. */
+     When direction is -1 (counter-clockwise): mirrored, so arrow points opposite way.
+
+     White until the match starts; once a colour is in play the ring takes it, so
+     the frame around the decks agrees with the discard glow and the colour orb. */
   if (pileLoop) {
     pileLoop.classList.toggle('reverse', state.direction === -1);
-    pileLoop.style.setProperty('--loop-color', state.current_color ? activeColor : 'var(--uno-yellow)');
+    pileLoop.style.setProperty('--loop-color', state.current_color ? activeColor : '#ffffff');
   }
 
   colorOrb.style.background = activeColor;

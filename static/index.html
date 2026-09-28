@@ -316,31 +316,43 @@
 
              The arc carries a dash gap where the head sits, so the two ends
              meet edge to edge under the head instead of overshooting and
-             showing a doubled stroke. The gap is a share of pathLength=100 and
-             is cut on the top edge, matching the head's position.
+             showing a doubled stroke.
 
-             The track is inset 10 units on every side. That inset is what the
-             arrowhead is drawn into: the head's base is wider than the stroke,
-             so it needs vertical room above and below the top edge, and an SVG
-             clips to its viewBox. The head therefore lives between y=1 and y=19
-             with its tip on the track line at y=10. -->
+             The track is inset 10 units on every side and the viewBox is
+             padded a further 12 beyond that, so the drawing spans -12..352 in
+             x and -12..202 in y. The padding is headroom for the arrowhead:
+             it is positioned by offset-path and rotates to follow the corners,
+             so its extremes sweep outside the track's own bounds and an SVG
+             clips to its viewBox. -->
         <span class="pile-loop" id="pileLoop" aria-hidden="true">
+          <!-- The viewBox matches the track (a 320x170 rect at 10,10 inside a
+               340x190 box) so that, under preserveAspectRatio="none", one
+               viewBox unit maps to the same fraction of the box in both axes.
+               That keeps the CSS box and the drawn track the same rectangle.
+
+               The arrowhead sweeps outside the track when it rotates through a
+               corner. That is handled by overflow:visible on the SVG rather
+               than by padding the viewBox: padding the viewBox desynchronises
+               the two axes under preserveAspectRatio="none", because the
+               horizontal and vertical scale factors differ once the viewBox
+               aspect ratio is no longer the box's. -->
           <svg class="pile-loop-svg" viewBox="0 0 340 190" fill="none"
                preserveAspectRatio="none"
                stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
             <!-- Rectangular track with rounded corners enclosing both decks.
-                 Outer dimensions in viewBox: 340 x 190, rx=ry=24.
+                 Coordinates are in the padded viewBox above: the track itself
+                 is 320 x 170 at (10,10), rx=ry=24.
                  pathLength="100" normalises the perimeter so the travelling dash
                  is expressed as a percentage of the outline. -->
             <rect class="pile-loop-track" x="10" y="10" width="320" height="170" rx="24" ry="24" />
             <rect class="pile-loop-arc" x="10" y="10" width="320" height="170" rx="24" ry="24" pathLength="100" />
-            <!-- Arrowhead, centred on the top edge pointing clockwise (right).
-                 The tip sits on the track line (y=10) so it reads as a
-                 continuation of the stroke rather than a separate mark. The
-                 base spans y=1..19, inside the viewBox so nothing is clipped,
-                 and is 20 units wide for a recognisable taper at this scale. -->
+            <!-- Arrowhead. It is positioned by offset-path in the stylesheet
+                 and travels one full lap of the track, so its coordinates here
+                 are a local shape only: the tip points along +x and the base
+                 sits behind it, because offset-rotate: auto turns the shape to
+                 face the direction of travel. -->
             <polygon class="pile-loop-head"
-                     points="194,10 174,1 174,19" />
+                     points="20,0 0,-9 0,9" />
           </svg>
         </span>
 

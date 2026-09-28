@@ -1170,15 +1170,16 @@ input { font-family: inherit; }
      Each dimension is a share of the pile group rather than of the viewport,
      so the ring stays concentric with the cards at every resolution.
 
-     The two insets are tied to the pile geometry rather than guessed: the
-     cards are --pile-w wide with a 47u gap between them, so the group is
-     2 * pile-w + 47u across and 1.5 * pile-w down. Insetting the ring by half
-     a card each way puts its sides one card clear of the group's edges and its
-     top and bottom level with the tops and bottoms of the cards, which is the
-     tightest ring that still leaves the stroke on the felt everywhere. The
-     gap used to be a flat 47u — a whole card's worth of empty felt on either
-     side of the ring, which read as a loose doodle rather than a frame around
-     the piles. ---------------------------------------------------------- */
+     The ring must clear the cards on all four sides. A card is --pile-w wide
+     and 1.5 * --pile-w tall, and each one is drawn with a 2px border plus a
+     4px offset box-shadow that spills outside its own box, so the true visual
+     edge is a few px wider than the layout box. The clearance below is that
+     spill plus real felt: at the old 0.36 / 0.16 the ring's left and right
+     edges ran underneath the cards and its top and bottom edges were buried
+     behind them, so only the corners showed.
+
+     Width and height are symmetric about the pile group, so the ring is
+     concentric with the two decks rather than offset toward one of them. */
 .pile-loop {
   position: absolute;
   left: 50%;
@@ -1186,11 +1187,28 @@ input { font-family: inherit; }
   /* Centring lives in the `translate` property rather than `transform`, so the
      reverse mirror below can use `transform` without fighting it. */
   translate: -50% -50%;
-  width: calc(100% + var(--pile-w) * 0.36);
-  height: calc(100% + var(--pile-w) * 0.16);
-  --loop-color: var(--uno-yellow);
+  /* Clearance is real pixels of felt, on top of the card group's own box, and
+     an equal amount on each opposite pair so the ring stays concentric with the
+     two decks.
+
+     The viewBox is 340x190 with the track a 320x170 rect inset 10 units inside
+     it, so the box below is `track + clearance` scaled by 340/320 and 190/170.
+     Those two factors are what make the drawn track - not the viewBox edge -
+     land the requested distance from the cards. Applying them per axis matters:
+     under preserveAspectRatio="none" the axes scale independently, so a single
+     shared factor would leave the ring off-centre.
+
+     0.60 / 0.30 of a card clears the card's 2px border and its 4px offset
+     box-shadow with felt to spare, which is what makes the ring read as
+     wrapping the decks instead of clipping their corners. */
+  width: calc((100% + var(--pile-w) * 0.60) * 340 / 320);
+  height: calc((100% + var(--pile-w) * 0.30) * 190 / 170);
+  --loop-color: #ffffff;
   pointer-events: none;
-  z-index: 0;
+  /* Above the cards: the ring is a frame around the decks, so it reads as
+     wrapping them. Below them it just looked like a stray line poking out
+     from behind each card. */
+  z-index: 3;
   color: var(--loop-color);
   transition: color 0.35s ease, filter 0.35s ease;
   /* In viewBox units and scaled with the drawing, so the ring keeps the same
@@ -1209,6 +1227,11 @@ input { font-family: inherit; }
   display: block;
   width: 100%;
   height: 100%;
+  /* The arrowhead rides the track, and when it rotates through a corner its
+     extremes sweep past the track's edge. Letting paint escape the SVG box is
+     what keeps those corners whole; without this the head is clipped exactly at
+     the point it turns. */
+  overflow: visible;
 }
 
 /* The rectangular loop itself, and the travelling dash drawn over it.
@@ -1227,9 +1250,18 @@ input { font-family: inherit; }
   stroke: currentColor;
 }
 
-/* The head is a filled shape pointing along the rectangular path. Its own
-   stroke is in user units like the rest of the drawing, so it stays constant
-   against the track and keeps the rounded join at the tip at every size. */
+/* The head is a filled shape that travels the rectangular path.
+
+   It is positioned with offset-path rather than by animating x/y, so it
+   follows the same rounded-rectangle geometry as the track and inherits the
+   corner radii for free. offset-rotate: auto makes it face the way it is
+   going, so the head turns the corners with the path instead of sliding along
+   at a fixed angle.
+
+   The path is written in the same user units as the viewBox (10,10 to 330,180,
+   r=24), so the head stays on the stroke at every window size. The dash below
+   carries the same gap, so the travelling head sits in the gap rather than on
+   top of a solid line. ------------------------------------------------- */
 .pile-loop-head {
   fill: currentColor;
   stroke: currentColor;
@@ -1237,6 +1269,17 @@ input { font-family: inherit; }
   stroke-linejoin: round;
   opacity: 0.95;
   filter: drop-shadow(0 0 8px currentColor);
+  offset-path: path('M 34,10 H 306 A 24,24 0 0 1 330,34 V 156 A 24,24 0 0 1 306,180 H 34 A 24,24 0 0 1 10,156 V 34 A 24,24 0 0 1 34,10 Z');
+  offset-rotate: auto;
+  offset-distance: 0%;
+  animation: pileHead 5s linear infinite;
+}
+
+/* One full lap. offset-distance is a percentage of the path, so 0% -> 100%
+   is exactly one lap and the loop closes seamlessly. */
+@keyframes pileHead {
+  from { offset-distance: 0%; }
+  to   { offset-distance: 100%; }
 }
 
 /* A dash travelling along the rectangular track.
@@ -1252,7 +1295,7 @@ input { font-family: inherit; }
    to the identical starting offset. ------------------------------------- */
 .pile-loop-arc {
   stroke: currentColor;
-  stroke-dasharray: 0 51.5 6.5 42;
+  stroke-dasharray: 14 86;
   animation: pileFlow 5s linear infinite;
 }
 
@@ -1262,9 +1305,11 @@ input { font-family: inherit; }
 }
 
 /* Motion is decoration: the direction is also stated in the banner, so
-   stopping the dash loses nothing. */
+   stopping the travel loses nothing. The head is parked on the top edge so the
+   ring still reads as directional when motion is off. */
 @media (prefers-reduced-motion: reduce) {
   .pile-loop-arc { animation: none; stroke-dasharray: none; opacity: 0; }
+  .pile-loop-head { animation: none; offset-distance: 30%; }
 }
 
 .draw-deck-3d {
@@ -1274,6 +1319,8 @@ input { font-family: inherit; }
   background: #101014;
   border: max(1.5px, calc(var(--pile-w) * 0.028)) solid rgba(255, 255, 255, 0.9);
   position: relative;
+  /* Under the direction ring, which is z-index 3 and frames both decks. */
+  z-index: 1;
   cursor: pointer;
   box-shadow: 2px 2px 0 rgba(255, 255, 255, 0.14),
               4px 4px 0 rgba(255, 255, 255, 0.08),
@@ -1332,6 +1379,8 @@ input { font-family: inherit; }
   display: flex;
   align-items: center;
   justify-content: center;
+  /* Under the direction ring, like the draw deck. */
+  z-index: 1;
   box-shadow: 0 0 0 2px var(--active-color, transparent),
               0 0 40px -10px var(--active-color, transparent);
   transition: box-shadow 0.45s ease;
